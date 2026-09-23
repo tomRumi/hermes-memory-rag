@@ -287,6 +287,103 @@ def install_plugin(home: Path, store_venv: Path, store: Path, backup_dir: Path,
     return True
 
 
+# The scheduled jobs, as (name, schedule, wrapper script, delivery, what it does).
+# Deliberately separate jobs rather than one do-everything job: a failure in the
+# import must not stop the backup, and each can be paused on its own.
+JOBS = [
+    ("memory backup (daily)", "0 3 * * *", "memory_backup.sh", "local",
+     "Run the daily memory backup: export the store as plain text, copy the wiki, "
+     "the memory files and the fact store into the backup repository, and commit."),
+    ("claude memory import (daily)", "0 4 * * *", "memory_claude_import.sh", "local",
+     "Import Claude Code's memory files into this project's memory, then re-index "
+     "the pages so they are searchable."),
+    ("memory review (weekly)", "0 5 * * 1", "memory_review.sh", "telegram",
+     "Weekly memory review: what each project holds, notes waiting to be merged, "
+     "notes worth reading side by side, and names on pages that no longer exist."),
+]
+
+
+def write_job_scripts(home: Path, server_venv: Path, report: Report, dry_run: bool) -> None:
+    """Write the job wrappers into the directory Hermes runs job scripts from.
+
+    The wrappers exist because the two halves need different interpreters: the
+    importer touches the fact store (which lives inside Hermes), the re-index
+    touches the vector library (which deliberately does not). A shell wrapper is
+    the only place that can hold both.
+    """
+    replacements = {
+        "__REPO__": str(REPO_ROOT),
+        "__SERVER_PY__": str(server_venv / "bin" / "python"),
+        "__HERMES_PY__": str(home / "hermes-agent" / "venv" / "bin" / "python"),
+        "__HERMES_HOME__": str(home),
+    }
+    target_dir = home / "scripts"
+    for _, _, script_name, _, _ in JOBS:
+        source = REPO_ROOT / "scripts" / "jobs" / script_name
+        if not source.is_file():
+            report.add(f"job script {script_name}", "skip", f"no template at {source}")
+            continue
+        body = source.read_text(encoding="utf-8")
+        for token, value in replacements.items():
+            body = body.replace(token, value)
+        destination = target_dir / script_name
+        if destination.is_file() and destination.read_text(encoding="utf-8") == body:
+            report.add(f"job script {script_name}", "skip", "already current")
+            continue
+        if dry_run:
+            report.add(f"job script {script_name}", "plan", str(destination))
+            continue
+        target_dir.mkdir(parents=True, exist_ok=True)
+        destination.write_text(body, encoding="utf-8")
+        destination.chmod(0o755)
+        report.add(f"job script {script_name}", "ok", str(destination))
+
+
+def register_jobs(home: Path, report: Report, dry_run: bool) -> None:
+    """Register the jobs with the scheduler, skipping any that already exist.
+
+    Existing jobs are left untouched: their delivery target, model and pause state
+    belong to the user, not to the installer.
+    """
+    hermes_bin = home / "hermes-agent" / "venv" / "bin" / "hermes"
+    if not hermes_bin.is_file():
+        report.add("scheduled jobs", "skip",
+                   f"no hermes command at {hermes_bin} — register them by hand")
+        return
+
+    existing: set[str] = set()
+    try:
+        data = json.loads((home / "cron" / "jobs.json").read_text(encoding="utf-8"))
+        for job in data.get("jobs", []):
+            existing.add(str(job.get("name") or ""))
+    except Exception:
+        pass
+
+    for name, schedule, script_name, deliver, prompt in JOBS:
+        if name in existing:
+            report.add(f"job {name}", "skip", "already registered")
+            continue
+        if dry_run:
+            report.add(f"job {name}", "plan", f"{schedule} -> {script_name}")
+            continue
+        command = [str(hermes_bin), "cron", "create", schedule, prompt,
+                   "--name", name, "--no-agent", "--script", script_name,
+                   "--deliver", deliver]
+        if deliver == "local":
+            # A job that stays quiet on success still has to be able to say it failed.
+            command += ["--failure-deliver", "telegram"]
+        try:
+            done = run(command, timeout=120)
+        except Exception as exc:  # noqa: BLE001
+            report.add(f"job {name}", "fail", str(exc))
+            continue
+        output = ((done.stdout or "") + (done.stderr or "")).strip()
+        if done.returncode == 0:
+            report.add(f"job {name}", "ok", f"{schedule}, deliver={deliver}")
+        else:
+            report.add(f"job {name}", "fail", output[-200:])
+
+
 def healthcheck(venv: Path, store: Path, report: Report, dry_run: bool) -> None:
     if dry_run:
         report.add("healthcheck", "plan", "would probe the embedder, the store and the server")
@@ -418,12 +515,16 @@ def main(argv: list[str] | None = None) -> int:
     backup_dir = Path(args.backup_dir).expanduser() if args.backup_dir else home / "memory-backup"
     install_plugin(home, store_venv, store, backup_dir, report, args.dry_run)
 
+    print("\nScheduled jobs")
+    write_job_scripts(home, store_venv, report, args.dry_run)
+    register_jobs(home, report, args.dry_run)
+
     print("\nExisting memory entries")
     if args.dry_run:
         report.add("memory file import", "plan", "would load MEMORY.md/USER.md into the fact store")
     else:
         importer = REPO_ROOT / "scripts" / "memory_file_import.py"
-        hermes_python = Path.home() / ".hermes" / "hermes-agent" / "venv" / "bin" / "python"
+        hermes_python = home / "hermes-agent" / "venv" / "bin" / "python"
         if hermes_python.exists():
             result = run([str(hermes_python), str(importer), "--home", str(home)], timeout=300)
             report.add("memory file import", "ok" if result.returncode == 0 else "skip",
@@ -439,8 +540,10 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     if not args.dry_run:
         print("\nNext: restart Hermes so it picks up the new server and provider, then run")
-        print("  hermes memory status                      # the provider should say holographic")
-        print("  <python> scripts/claude_memory_import.py --apply   # bring Claude Code's notes in")
+        print("  hermes memory status                 # the provider should say holographic")
+        print("  <hermes python> scripts/claude_memory_import.py --apply   # Claude Code's notes")
+        print("  <server python> scripts/reindex_wiki.py                   # and make them findable")
+        print("The scheduled jobs were registered above; `hermes cron list` shows them.")
     return 0
 
 

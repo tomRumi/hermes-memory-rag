@@ -183,12 +183,24 @@ Three, as separate triggers rather than one bundled job, so a failure in one is 
 | when | what | runs |
 |---|---|---|
 | daily 03:00 | back up and commit | `scripts/backup.py` |
-| daily 04:00 | read Claude Code's memory files | `scripts/claude_memory_import.py` |
+| daily 04:00 | read Claude Code's memory files, then re-index the pages | `scripts/claude_memory_import.py`, `scripts/reindex_wiki.py` |
 | weekly Monday 05:00 | review: inventory, near-duplicates, names that no longer exist | `scripts/weekly_review.py` |
 
-They are script jobs with no model involved, so they cost nothing to run. The daily ones stay silent
-unless something changed or failed; the weekly review always speaks, because a report that only
-appears when it is worried is a report nobody reads.
+These are three separate jobs rather than one do-everything job: a failure in the import must not stop
+the backup, and each can be paused on its own. They run as scripts with no model involved
+(`--no-agent`), so they cost nothing and cannot invent anything.
+
+The jobs are shell wrappers under `~/.hermes/scripts/` (`scripts/jobs/*.sh` here, with the paths filled
+in at install time). A wrapper is needed because the two halves want different interpreters: the
+importer touches the fact store, which lives inside Hermes, while re-indexing touches the vector
+library, which deliberately lives outside it. **Copying pages without re-indexing them leaves files
+that nothing can find**, which is why the second step is part of the same job.
+
+The daily jobs stay silent when there is nothing to say and print when something changed or failed
+(failures go to Telegram so a quiet job cannot fail invisibly). The weekly review speaks every time.
+
+The weekly review speaks every time, because a report that only appears when it is worried is a
+report nobody reads.
 
 ## Bringing in Claude Code's memory
 

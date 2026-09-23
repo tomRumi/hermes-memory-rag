@@ -1,0 +1,5 @@
+name: hermes-memory-rag
+version: 0.1.0
+description: "Project memory that outlives the context window: a local Chroma store with wiki, code and learning layers, plus the scripts to merge, export and rebuild it."
+author: "tomRumi"
+homepage: "https://github.com/tomRumi/hermes-memory-rag"

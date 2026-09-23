@@ -44,7 +44,8 @@ Served over MCP as a server named `hermes-memory-rag`:
 
 ```python
 recall(query, project="", layer="auto", top_wiki=2, top_code=3, top_memory=1) -> str
-learn(text, kind="learning", project="") -> str
+learn(text, kind="learning", project="", supersedes="") -> str
+retire(node_id, reason="", project="") -> str
 stats(project="") -> str
 ingest_code(root, project="", rebuild=True) -> str
 ingest_wiki(wiki_dir, project="") -> str
@@ -52,10 +53,32 @@ ingest_wiki(wiki_dir, project="") -> str
 
 `recall` searches wiki, then code, then memory, and returns a bounded amount of text — two wiki
 sections, three code pieces and one learning by default, 600 characters each. If it returned more,
-every message would cost more.
+every message would cost more. It also searches a cross-project layer last, labelled `[global]`, so a
+fact that applies everywhere is reachable without being filed under a project.
 
 `learn` is idempotent: storing the same text twice changes nothing. When staging reaches ten notes
 it reports that a merge is due.
+
+## Nothing is deleted
+
+Facts get out of date. The tempting move is to overwrite or delete, which is how a memory system
+loses the very thing it exists to keep. Instead every note carries a status, and recall returns only
+live ones:
+
+| status | meaning | how it happens |
+|---|---|---|
+| `active` | current, returned by recall | every write |
+| `superseded` | something replaced it; `superseded_by` names the successor | `learn(..., supersedes=<id>)` |
+| `retired` | withdrawn; nothing replaced it | `retire(<id>, reason=...)` |
+| `archived` | moved out of the way when staging overflows | automatic, past the cap |
+
+A replaced or withdrawn fact stays in the store with its text intact, so the change is reversible and
+you can still read what the earlier belief was. Recall prints a short id for memory hits — that is
+what you pass to `supersedes` or `retire`. An unknown or ambiguous id changes nothing and says so,
+because marking the wrong fact is worse than doing nothing.
+
+This is also why the staging cap no longer destroys anything: past it, the oldest notes are marked
+`archived` rather than dropped.
 
 ## Where the data lives
 
@@ -79,10 +102,29 @@ All optional; the defaults are the ones above.
 | `HERMES_RAG_MAX_CHARS` | `600` | characters allowed per returned hit |
 | `HERMES_RAG_CHUNK_CHAR_CAP` | `4500` | largest piece of text sent to the embedder |
 | `HERMES_RAG_SKIP_JSON_DIRS` | empty | comma-separated directories whose generated JSON should never be indexed |
+| `HERMES_RAG_PROJECTS_FILE` | `~/.hermes/projects.yaml` | which project a directory belongs to |
+| `HERMES_RAG_EDITOR_MODEL` | `granite4:3b` | the model that merges notes into the wiki |
 
 If your project keeps generated JSON indexes or caches in a directory of their own, add it to
 `HERMES_RAG_SKIP_JSON_DIRS`. They are worthless for searching and, because JSON is dense, a
 4500-character piece of it can exceed the embedding model's limit.
+
+## Which project am I in?
+
+Left alone, the engine names a project after the working directory it happens to be in. That is wrong
+often enough to matter: two projects can share a directory name, and a session's working directory is
+not necessarily the project being discussed. A small file removes the guess:
+
+```yaml
+# ~/.hermes/projects.yaml
+- path: /home/me/code/site-a
+  project: site-a
+- path: /home/me/code/api-server
+  project: api
+```
+
+The longest matching path wins, so a directory inside another can name its own project. With no file,
+or no match, the directory's name is used as before.
 
 ## Requirements
 
@@ -119,6 +161,10 @@ and makes it seconds instead of minutes.
 `restore_store.py` refuses to run when the export was made with a different embedding model, rather
 than quietly producing a store that answers differently.
 
+A store written by an older version of this project has notes with no status. `scripts/migrate_status.py`
+fills that in — dry run by default, `--apply` to write. It only adds fields: nothing is rewritten or
+removed, and running it twice changes nothing.
+
 ## What it stores, and privacy
 
 Everything stays on your machine. Nothing is uploaded. But be clear about what the store contains:
@@ -128,10 +174,13 @@ it out of any repository.
 
 ## Status
 
-Built and testable: the server, and the scripts for merging, exporting, restoring and comparing.
+Built and testable: the server (recall, learn, retire, stats, ingest), the status model that makes
+replacement and withdrawal reversible, the cross-project layer, project attribution from a file of
+paths, and the scripts for merging, migrating, exporting, restoring and comparing.
 
-Not built yet: the installer, the part that retrieves memory before each message, the desktop window,
-and the scheduled jobs. The layout above is the shape the rest will fit into.
+Not built yet: the installer, the part that retrieves memory before each message and mirrors the
+agent's own memory file, the desktop window, and the scheduled jobs. The layout above is the shape the
+rest will fit into.
 
 ## Licence
 

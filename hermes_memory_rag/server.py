@@ -46,6 +46,153 @@ MAX_CHARS_PER_HIT = int(os.environ.get("HERMES_RAG_MAX_CHARS", "600"))
 # 4500 chars ≈ 1800 tokens — safe margin under the context ceiling.
 CHUNK_CHAR_CAP = int(os.environ.get("HERMES_RAG_CHUNK_CHAR_CAP", "4500"))
 
+# ── node status ───────────────────────────────────────────────────────────
+# Every node carries a status, and recall returns only live ones. A fact that has
+# been replaced, withdrawn or moved aside therefore stops being handed to the
+# model while staying in the store, so a wrong judgement is reversible and the
+# history is auditable. Nodes written before this existed carry no status and are
+# treated as live, so an un-migrated store keeps working.
+STATUS_ACTIVE = "active"
+STATUS_SUPERSEDED = "superseded"  # replaced by another node, named in superseded_by
+STATUS_RETIRED = "retired"        # withdrawn; nothing replaced it
+STATUS_ARCHIVED = "archived"      # moved out of the way (staging overflow)
+NON_LIVE_STATUSES = (STATUS_SUPERSEDED, STATUS_RETIRED, STATUS_ARCHIVED)
+
+# The cross-project memory layer. Reserved name: a project may not be called this.
+GLOBAL_PROJECT = "global"
+
+# Kinds that mirror the agent's own memory file into the store. They are kept so
+# that removing an entry from that file stops being destructive, but they are not
+# learnings: they must not count toward the merge threshold, and consolidation
+# must not route them into the wiki.
+MIRROR_KIND_PREFIX = "memory"
+
+
+def _now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _stamp(metadata: dict, *, source: str) -> dict:
+    """Add the fields every node carries: status, source (and created where absent)."""
+    metadata.setdefault("status", STATUS_ACTIVE)
+    metadata.setdefault("source", source)
+    metadata.setdefault("created", _now())
+    return metadata
+
+
+def _is_live(hit_or_meta) -> bool:
+    """False for a node that must not be handed to the model.
+
+    Missing status counts as live: an un-migrated store still answers.
+    """
+    meta = getattr(hit_or_meta, "metadata", None)
+    if meta is None:
+        meta = hit_or_meta if isinstance(hit_or_meta, dict) else {}
+    return (meta.get("status") or STATUS_ACTIVE) not in NON_LIVE_STATUSES
+
+
+def _resolve_node_id(col, prefix: str) -> str | None:
+    """Resolve a node id from an abbreviated form (as recall prints it).
+
+    Exact id wins; otherwise a unique prefix match. Returns None when the prefix
+    matches nothing, or when it is ambiguous — an ambiguous reference must never
+    silently mark the wrong fact.
+    """
+    ids = (col.get(include=[]) or {}).get("ids") or []
+    if prefix in ids:
+        return prefix
+    matches = [i for i in ids if i.startswith(prefix)]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _staging_count(col) -> int:
+    """Notes that count toward the merge threshold.
+
+    Mirrored memory-file nodes are excluded: they are a copy of something that
+    already lives in the context window, so counting them would report a merge as
+    due when no session has actually learned anything.
+    """
+    got = col.get(include=["metadatas"]) or {}
+    total = 0
+    for meta in got.get("metadatas") or []:
+        meta = meta or {}
+        if str(meta.get("kind") or "").startswith(MIRROR_KIND_PREFIX):
+            continue
+        if meta.get("status") in NON_LIVE_STATUSES:
+            continue
+        total += 1
+    return total
+
+
+# ── which project is this? ────────────────────────────────────────────────
+# Falling back to the name of the working directory is wrong often enough to
+# matter: several projects can share a directory name, and a session's working
+# directory is wherever the shell happens to be, not necessarily the project being
+# discussed. A file of path prefixes removes the guess. Without one, the old
+# behaviour stands, so nothing breaks for an install that has never configured it.
+
+PROJECTS_FILE = Path(os.environ.get(
+    "HERMES_RAG_PROJECTS_FILE", str(Path.home() / ".hermes" / "projects.yaml")))
+
+
+def _load_project_map(path: Path | None = None) -> list[tuple[str, str]]:
+    """(path prefix, project) pairs from the projects file, longest prefix first.
+
+    The file is a plain list of ``- path: /where/it/is`` / ``project: name``
+    entries. A missing or unreadable file yields no mapping rather than an error:
+    project attribution must never be the reason a session cannot work.
+    """
+    path = path or PROJECTS_FILE
+    try:
+        text = path.expanduser().read_text(encoding="utf-8")
+    except OSError:
+        return []
+
+    pairs: list[tuple[str, str]] = []
+    prefix = project = None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("- "):
+            prefix = project = None
+            line = line[2:].strip()
+        if ":" not in line:
+            continue
+        key, _, value = line.partition(":")
+        key, value = key.strip().lower(), value.strip().strip("'\"")
+        if key in ("path", "prefix", "dir", "root"):
+            prefix = value
+        elif key in ("project", "name", "slug"):
+            project = value
+        if prefix and project:
+            pairs.append((str(Path(prefix).expanduser()), project))
+            prefix = project = None
+
+    # Longest matching prefix wins, so a nested directory can name its own project.
+    pairs.sort(key=lambda pair: len(pair[0]), reverse=True)
+    return pairs
+
+
+def _resolve_project(explicit: str = "", cwd: str | None = None) -> str:
+    """The project a call belongs to.
+
+    An explicit name always wins. Otherwise the working directory is matched
+    against the projects file, and only if nothing matches is the directory name
+    used — the old, guessy behaviour.
+    """
+    if explicit.strip():
+        return explicit.strip()
+    here = Path(cwd or os.getcwd())
+    for prefix, project in _load_project_map():
+        try:
+            here.relative_to(prefix)
+        except ValueError:
+            continue
+        return project
+    return here.name
+
+
 # Machine-generated files: worthless for retrieval, context-busters.
 _MACHINE_SUFFIXES = (".lock", ".min.js", ".min.css", ".map", ".svg")
 _MACHINE_BASENAMES = ("package-lock.json", "yarn.lock", "poetry.lock",
@@ -149,7 +296,7 @@ def _det_id(prefix: str, *parts: str) -> str:
     return f"{digest[:8]}-{digest[8:12]}-{digest[12:16]}-{digest[16:20]}-{digest[20:32]}"
 
 
-def _render_hits(hits, tag: str, cap: int = MAX_CHARS_PER_HIT) -> list[str]:
+def _render_hits(hits, tag: str, cap: int = MAX_CHARS_PER_HIT, show_id: bool = False) -> list[str]:
     out = []
     for node in hits:
         text = (node.get_content() or "").strip().replace("\n", " ")
@@ -159,6 +306,11 @@ def _render_hits(hits, tag: str, cap: int = MAX_CHARS_PER_HIT) -> list[str]:
         src = meta.get("path", "?")
         section = meta.get("section", "")
         label = f"{src}::{section}" if section else src
+        if show_id and (node_id := getattr(node, "node_id", "")):
+            # A short form of the stored id, so a later call can name this exact
+            # fact when replacing it (learn(supersedes=...)) or withdrawing it
+            # (retire(...)). Only shown where that matters — the memory layer.
+            label = f"{label} #{node_id[:8]}"
         out.append(f"[{tag} {label}] {text}")
     return out
 
@@ -207,8 +359,9 @@ def recall(query: str, project: str = "", layer: str = "auto",
            top_wiki: int = 2, top_code: int = 3, top_memory: int = 1) -> str:
     """Layered context recall for a project: wiki (map) → code (detail) →
     memory (prior session learnings). Bounded output; honest per-layer status.
-    `project` defaults to the cwd basename; `layer` = auto|wiki|code|memory."""
-    project = project or os.path.basename(os.getcwd())
+    `project` defaults to whatever the projects file says the working directory
+    belongs to, falling back to its name; `layer` = auto|wiki|code|memory."""
+    project = _resolve_project(project)
     names = _collection_names(project)
     client = _client()
     embed = _embed_model()
@@ -230,21 +383,45 @@ def recall(query: str, project: str = "", layer: str = "auto",
                 lines.append(f"[{which}: not built for {project}]")
             continue
         try:
-            hits = _search_collection(client, name, query, top, embed)
-            rendered = _render_hits(hits, which)
+            # Over-fetch, then drop anything superseded, retired or archived: a
+            # fact that was replaced must not be handed to the model, and dropping
+            # it must not quietly shrink what the caller asked for.
+            hits = [h for h in _search_collection(client, name, query, top * 3, embed)
+                    if _is_live(h)][:top]
+            rendered = _render_hits(hits, which, show_id=(which == "memory"))
             lines += rendered or [f"[{which}: no results]"]
         except Exception as exc:  # noqa: BLE001 - retrieval never crashes a session
             lines.append(f"[{which} unavailable: {exc}]")
+
+    # Cross-project memory, after the project's own layers so a project hit always
+    # comes first, and capped so it cannot crowd out project context. A project is
+    # never silently read as the global one: this is a separate, labelled pass.
+    if _wanted("memory") and _slugify(project) != GLOBAL_PROJECT:
+        gname = _collection_names(GLOBAL_PROJECT)["memory"]
+        if _count(client, gname):
+            try:
+                ghits = [h for h in _search_collection(client, gname, query, top_memory * 3, embed)
+                         if _is_live(h)][:top_memory]
+                lines += [f"[global] {line}" for line in
+                          _render_hits(ghits, "memory", show_id=True)]
+            except Exception as exc:  # noqa: BLE001
+                lines.append(f"[global memory unavailable: {exc}]")
     return "\n".join(lines)
 
 
 @mcp.tool()
-def learn(text: str, kind: str = "learning", project: str = "") -> str:
+def learn(text: str, kind: str = "learning", project: str = "",
+          supersedes: str = "") -> str:
     """Deposit ONE learning into the project's episodic memory (staging area).
     kind may carry a module prefix for consolidation routing, e.g.
     'rag:gotcha' or 'config:decision'. Learnings only — routine actions are
-    logging, not learning, and belong in session transcripts."""
-    project = project or os.path.basename(os.getcwd())
+    logging, not learning, and belong in session transcripts.
+
+    `supersedes` names an existing note (the short id recall prints, or a unique
+    prefix of it) that this one replaces. The old note is marked as replaced and
+    stops being returned, but is kept, so the change is reversible and you can
+    still see what the earlier fact was. Use it instead of rewriting history."""
+    project = _resolve_project(project)
     text = text.strip()
     if not text:
         raise ValueError("refusing to store an empty learning")
@@ -262,32 +439,53 @@ def learn(text: str, kind: str = "learning", project: str = "") -> str:
     embed = _embed_model()
     _embedder_healthcheck(embed)
     vector = embed.get_text_embedding(text)
+    metadata = _stamp({"path": "memory", "layer": "memory", "kind": kind}, source="learn")
     col.upsert(
         ids=[node_id],
         embeddings=[vector],
         documents=[text],
-        metadatas=[{
-            "path": "memory",
-            "layer": "memory",
-            "kind": kind,
-            "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        }],
+        metadatas=[metadata],
     )
-    # Backstop cap: prune oldest beyond the staging cap.
-    if col.count() > MEMORY_CAP:
+
+    note = ""
+    if supersedes:
+        target = _resolve_node_id(col, supersedes.strip())
+        if target is None:
+            note = (f" || supersedes={supersedes!r} matched no single note — "
+                    f"nothing was marked as replaced")
+        else:
+            old = (col.get(ids=[target], include=["metadatas"])["metadatas"] or [{}])[0] or {}
+            col.update(ids=[target], metadatas=[
+                {**old, "status": STATUS_SUPERSEDED, "superseded_by": node_id}])
+            _log_event(project, "supersede", f"{target}->{node_id}")
+            note = f" || replaced {target[:8]}"
+
+    # Backstop past the cap: the oldest notes are moved aside, never deleted. They
+    # keep their text, stop being returned by recall, and remain countable in the
+    # store — so the promise that nothing is lost holds even at the limit.
+    if _staging_count(col) > MEMORY_CAP:
         all_meta = col.get(include=["metadatas"])
-        pairs = sorted(
-            zip(all_meta["ids"], all_meta["metadatas"]),
-            key=lambda p: str(p[1].get("created", "")),
-        )
-        overflow = col.count() - MEMORY_CAP
-        col.delete(ids=[pid for pid, _ in pairs[:overflow]])
+        live = [
+            (pid, meta or {})
+            for pid, meta in zip(all_meta["ids"], all_meta["metadatas"])
+            if (meta or {}).get("status", STATUS_ACTIVE) == STATUS_ACTIVE
+            and not str((meta or {}).get("kind") or "").startswith(MIRROR_KIND_PREFIX)
+        ]
+        live.sort(key=lambda pair: str(pair[1].get("created", "")))
+        overflow = len(live) - MEMORY_CAP
+        for pid, meta in live[:max(0, overflow)]:
+            col.update(ids=[pid], metadatas=[{**meta, "status": STATUS_ARCHIVED}])
+        if overflow > 0:
+            _log_event(project, "archive", f"{overflow} of {len(live)} notes archived")
+            note += f" || {overflow} oldest note(s) archived (kept, no longer returned)"
+
     _log_event(project, "learn", kind)
 
-    result = node_id
-    if col.count() >= CONSOLIDATE_THRESHOLD:
+    staged = _staging_count(col)
+    result = node_id + note
+    if staged >= CONSOLIDATE_THRESHOLD:
         result += (
-            f" || CONSOLIDATION DUE: staging at {col.count()} >= "
+            f" || CONSOLIDATION DUE: staging at {staged} >= "
             f"{CONSOLIDATE_THRESHOLD} — run scripts/consolidate.py {project} "
             f"--apply (dry-run first)"
         )
@@ -295,11 +493,35 @@ def learn(text: str, kind: str = "learning", project: str = "") -> str:
 
 
 @mcp.tool()
+def retire(node_id: str, reason: str = "", project: str = "") -> str:
+    """Withdraw a memory note that nothing replaces — a fact found to be wrong, or
+    one that no longer applies. The note stays in the store (so the withdrawal is
+    reversible and the history readable) but recall stops returning it.
+
+    `node_id` is the short id recall prints, or any unique prefix of it. An
+    ambiguous or unknown reference changes nothing and says so."""
+    project = _resolve_project(project)
+    client = _client()
+    col = client.get_or_create_collection(_collection_names(project)["memory"])
+    target = _resolve_node_id(col, node_id.strip())
+    if target is None:
+        return (f"no single memory note matches {node_id!r} — nothing changed. "
+                f"Call recall first and use the id it prints.")
+    meta = (col.get(ids=[target], include=["metadatas"])["metadatas"] or [{}])[0] or {}
+    if meta.get("status") in NON_LIVE_STATUSES:
+        return f"{target[:8]} is already {meta.get('status')} — nothing changed"
+    col.update(ids=[target], metadatas=[
+        {**meta, "status": STATUS_RETIRED, "retired_reason": reason[:200]}])
+    _log_event(project, "retire", f"{target} {reason[:100]}")
+    return f"retired {target[:8]}" + (f" ({reason[:80]})" if reason else "")
+
+
+@mcp.tool()
 def stats(project: str = "") -> str:
     """Layer counts + wiki-earn suggestion for a project. The suggestion rule:
     (≥3 sessions AND ≥5 learnings) OR (≥3 architecture-phrased recalls) on a
     project with no wiki → suggest generating the wiki."""
-    project = project or os.path.basename(os.getcwd())
+    project = _resolve_project(project)
     names = _collection_names(project)
     client = _client()
     conn = _ledger()
@@ -320,12 +542,21 @@ def stats(project: str = "") -> str:
     conn.close()
 
     counts = {w: _count(client, names[w]) for w in names}
+    # The cross-project layer is reported on its own: it is not this project's
+    # memory, and lumping it in would make the counts lie.
+    global_memory = _count(client, _collection_names(GLOBAL_PROJECT)["memory"])
     has_wiki = counts["wiki"] > 0
     earned = (not has_wiki) and ((sessions >= 3 and learnings >= 5) or arch_recalls >= 3)
+
+    # "memory" in layers counts every note ever stored, including replaced and
+    # moved-aside ones. The number that drives merging is the live staging count.
+    staged = _staging_count(client.get_or_create_collection(names["memory"]))
 
     report = {
         "project": project,
         "layers": counts,
+        "staged_notes": staged,
+        "global_memory_notes": global_memory,
         "distinct_active_days": sessions,
         "learnings_deposited": learnings,
         "architecture_phased_recalls": arch_recalls,
@@ -333,7 +564,7 @@ def stats(project: str = "") -> str:
             "GENERATE — this repo has earned a wiki" if earned
             else ("wiki present" if has_wiki else "not yet earned")
         ),
-        "consolidation_due": counts["memory"] >= CONSOLIDATE_THRESHOLD,
+        "consolidation_due": staged >= CONSOLIDATE_THRESHOLD,
     }
     return json.dumps(report, indent=2)
 
@@ -395,8 +626,9 @@ def ingest_code(root: str, project: str = "", rebuild: bool = True) -> str:
         if not text.strip():
             continue
         docs.append(Document(text=text[:200_000],
-                             metadata={"path": str(p.relative_to(root_path)),
-                                       "layer": "code"}))
+                             metadata=_stamp(
+                                 {"path": str(p.relative_to(root_path)), "layer": "code"},
+                                 source="ingest_code")))
     if not docs:
         return f"no indexable files under {root_path}"
 
@@ -500,8 +732,9 @@ def ingest_wiki(wiki_dir: str, project: str = "") -> str:
         for idx, chunk in enumerate(_heading_chunks(text)):
             docs.append(Document(
                 text=chunk,
-                metadata={"path": str(p.relative_to(root)), "layer": "wiki",
-                          "section": "", "chunk_index": idx},
+                metadata=_stamp(
+                    {"path": str(p.relative_to(root)), "layer": "wiki",
+                     "section": "", "chunk_index": idx}, source="ingest_wiki"),
             ))
 
     class _Embed(TransformComponent):

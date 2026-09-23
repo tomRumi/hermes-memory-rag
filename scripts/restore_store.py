@@ -103,11 +103,16 @@ def restore(src: Path, store: Path, force: bool) -> int:
 
     model = None
     for name, nodes in sorted(by_collection.items()):
+        # Read-only existence check. get_or_create would create the collection
+        # here, without the settings recorded in the export — and the real
+        # get_or_create below would then find it already there and silently keep
+        # the default distance measure, producing a store that answers differently
+        # from the original.
         existing = 0
         try:
-            existing = client.get_or_create_collection(name).count()
+            existing = client.get_collection(name).count()
         except Exception:
-            existing = 0
+            existing = 0  # not present yet
         if existing and not force:
             raise SystemExit(
                 f"collection {name!r} already holds {existing} nodes in {store}. "

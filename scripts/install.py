@@ -256,6 +256,17 @@ def install_plugin(home: Path, store_venv: Path, store: Path, backup_dir: Path,
             if (target / folder).exists():
                 shutil.rmtree(target / folder)
             shutil.copytree(source, target / folder)
+    # The window itself goes to the desktop plugin directory. Measured, not
+    # assumed: the app loads desktop halves from there and does NOT pick up the
+    # copy inside the plugin package, so placing it only in the package leaves a
+    # window that never appears.
+    desktop_target = home / "desktop-plugins" / PLUGIN_NAME
+    desktop_source = REPO_ROOT / "desktop" / "plugin.js"
+    if desktop_source.exists():
+        desktop_target.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(desktop_source, desktop_target / "plugin.js")
+        report.add("window", "ok", f"installed at {desktop_target}")
+
     # Where everything lives, so the window's routes can find the scripts. Written
     # rather than guessed: the repository is not inside the plugin directory.
     (target / "install.json").write_text(json.dumps({

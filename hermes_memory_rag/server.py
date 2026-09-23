@@ -61,11 +61,15 @@ NON_LIVE_STATUSES = (STATUS_SUPERSEDED, STATUS_RETIRED, STATUS_ARCHIVED)
 # The cross-project memory layer. Reserved name: a project may not be called this.
 GLOBAL_PROJECT = "global"
 
-# Kinds that mirror the agent's own memory file into the store. They are kept so
+# Notes that mirror the agent's own memory file into the store. They are kept so
 # that removing an entry from that file stops being destructive, but they are not
 # learnings: they must not count toward the merge threshold, and consolidation
 # must not route them into the wiki.
-MIRROR_KIND_PREFIX = "memory"
+#
+# Marked by a field, not by the kind string. An earlier version keyed off kinds
+# starting with "memory", which silently swallowed legitimate learnings filed as
+# "memory:decision" — they were stored, never merged, and nothing said so.
+MIRROR_SOURCE = "memory_file"
 
 
 def _now() -> str:
@@ -108,15 +112,16 @@ def _resolve_node_id(col, prefix: str) -> str | None:
 def _staging_count(col) -> int:
     """Notes that count toward the merge threshold.
 
-    Mirrored memory-file nodes are excluded: they are a copy of something that
-    already lives in the context window, so counting them would report a merge as
-    due when no session has actually learned anything.
+    A node copied in from the agent's own memory file is excluded: it is a copy of
+    something that already lives in the context window, so counting it would report
+    a merge as due when no session had actually learned anything. Those nodes mark
+    themselves with a source of ``memory_file``.
     """
     got = col.get(include=["metadatas"]) or {}
     total = 0
     for meta in got.get("metadatas") or []:
         meta = meta or {}
-        if str(meta.get("kind") or "").startswith(MIRROR_KIND_PREFIX):
+        if meta.get("source") == MIRROR_SOURCE:
             continue
         if meta.get("status") in NON_LIVE_STATUSES:
             continue
@@ -469,7 +474,7 @@ def learn(text: str, kind: str = "learning", project: str = "",
             (pid, meta or {})
             for pid, meta in zip(all_meta["ids"], all_meta["metadatas"])
             if (meta or {}).get("status", STATUS_ACTIVE) == STATUS_ACTIVE
-            and not str((meta or {}).get("kind") or "").startswith(MIRROR_KIND_PREFIX)
+            and (meta or {}).get("source") != MIRROR_SOURCE
         ]
         live.sort(key=lambda pair: str(pair[1].get("created", "")))
         overflow = len(live) - MEMORY_CAP

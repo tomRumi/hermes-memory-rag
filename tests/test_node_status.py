@@ -54,6 +54,12 @@ def _memory_collection(client, project):
     return client.get_or_create_collection(server._collection_names(project)["memory"])
 
 
+def col_get(client, project, node_id):
+    """The metadata currently stored for one node."""
+    col = _memory_collection(client, project)
+    return (col.get(ids=[node_id], include=["metadatas"])["metadatas"] or [{}])[0]
+
+
 def _status_of(client, project, text):
     col = _memory_collection(client, project)
     node_id = server._det_id("mem", text)
@@ -167,12 +173,26 @@ class TestOverflowArchivesInsteadOfDeleting:
 
 
 class TestStagingCount:
+    def test_a_learning_kind_starting_with_memory_still_counts(self, store):
+        """Regression: mirroring used to be detected from the kind string, so a
+        note filed as "memory:decision" was stored, never merged and never
+        reported. Detection is a field now, so any kind is safe."""
+        server.learn("a decision about memory layout", kind="memory:decision",
+                     project="counttest0")
+        col = _memory_collection(store, "counttest0")
+        assert server._staging_count(col) == 1
+
     def test_mirrored_memory_notes_do_not_count(self, store):
         for i in range(3):
             server.learn(f"a real learning {i}", kind="rag:gotcha", project="counttest")
+        # A mirror writer marks itself through the source field.
         for i in range(4):
             server.learn(f"an entry mirrored from the memory file {i}",
-                         kind="memory:fact", project="counttest")
+                         kind="generic", project="counttest")
+            node_id = server._det_id("mem", f"an entry mirrored from the memory file {i}")
+            meta = col_get(store, "counttest", node_id)
+            _memory_collection(store, "counttest").update(
+                ids=[node_id], metadatas=[{**meta, "source": server.MIRROR_SOURCE}])
 
         col = _memory_collection(store, "counttest")
         assert col.count() == 7

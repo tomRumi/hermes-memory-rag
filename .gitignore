@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.eggs/
+*.egg-info/
+
+# The memory store never belongs in this repo. It holds your own notes,
+# code excerpts and the questions you have asked.
+hermes-rag/
+chroma.sqlite3
+*.sqlite3
+
+# Backups and their embedding-numbers files
+*.jsonl
+!tests/fixtures/*.jsonl
+
+# Local artefacts
+*.log
+.DS_Store

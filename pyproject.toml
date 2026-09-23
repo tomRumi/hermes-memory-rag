@@ -1,0 +1,24 @@
+[project]
+name = "hermes-memory-rag"
+version = "0.1.0"
+description = "Project memory that outlives the context window: a Chroma store with wiki, code and learning layers, served to Hermes as an MCP server"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "chromadb>=1.5,<2",
+    "llama-index-core>=0.12,<0.14",
+    "llama-index-embeddings-ollama>=0.6,<0.8",
+    "llama-index-vector-stores-chroma>=0.4,<0.7",
+    "mcp>=1.2,<2",
+    "pydantic>=2,<3",
+]
+
+[project.scripts]
+hermes-memory-rag = "hermes_memory_rag.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["hermes_memory_rag"]

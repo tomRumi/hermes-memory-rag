@@ -126,6 +126,79 @@ not necessarily the project being discussed. A small file removes the guess:
 The longest matching path wins, so a directory inside another can name its own project. With no file,
 or no match, the directory's name is used as before.
 
+## Install
+
+```
+python scripts/install.py                    # every profile it finds
+python scripts/install.py --dry-run          # show the plan, change nothing
+python scripts/install.py --profile default  # just one profile
+python scripts/install.py --migrate-from hermes-rag   # replace an older server entry
+```
+
+It checks what it needs first and stops if something is missing, saying the exact command to fix
+it. Then it builds a **private environment** for the memory server and installs this package into
+that — deliberately not into Hermes's own environment, because installing a vector database into
+Hermes is how a working Hermes stops working.
+
+It proves the server starts *before* it touches any config, because a config pointing at a server
+that does not start is worse than no config at all. Config files are backed up before being edited,
+and the edit is textual, so your comments survive. Running it twice changes nothing.
+
+Two things it does that are easy to miss:
+
+- it sets `memory.provider` to the bundled **holographic** provider, which is the part that recalls
+  facts before each message — see "Where the facts live" below;
+- it loads the entries already in `MEMORY.md` / `USER.md` into that fact store, so the standing rules
+  the agent has been following are there from the first session rather than the next one.
+
+## Where the facts live
+
+Two different things, in two different places, on purpose:
+
+| | what | where |
+|---|---|---|
+| facts, preferences, decisions — recalled before every message | the bundled `holographic` provider | `~/.hermes/memory_store.db` (one SQLite file) |
+| code and written pages — searched when asked for | this project's server | `~/hermes-rag` plus `~/.hermes/wikis/` |
+
+The split exists because they have different jobs. A preference needs to come back on its own,
+every turn. A page about how a project works is looked up when a question needs it. The first is a
+few hundred short facts; the second is thousands of text pieces.
+
+## The window
+
+A chip in the desktop status bar opens a small panel: what each project holds, how many notes are
+waiting to be merged, when the last backup ran, and buttons for **Backup now**, **Export…**,
+**Import…**, **Claude Code memory** and **Review**, plus the switch that turns pushing the backup to
+a remote on and off.
+
+The window cannot run commands itself, and it must not — the store's libraries are not in Hermes's
+environment. Every button calls this plugin's own backend routes
+(`/api/plugins/hermes-memory-rag/...`), which run the scripts below in the environment they were
+installed into.
+
+## Scheduled jobs
+
+Three, as separate triggers rather than one bundled job, so a failure in one is obvious:
+
+| when | what | runs |
+|---|---|---|
+| daily 03:00 | back up and commit | `scripts/backup.py` |
+| daily 04:00 | read Claude Code's memory files | `scripts/claude_memory_import.py` |
+| weekly Monday 05:00 | review: inventory, near-duplicates, names that no longer exist | `scripts/weekly_review.py` |
+
+They are script jobs with no model involved, so they cost nothing to run. The daily ones stay silent
+unless something changed or failed; the weekly review always speaks, because a report that only
+appears when it is worried is a report nobody reads.
+
+## Bringing in Claude Code's memory
+
+If you also use Claude Code, it keeps curated notes per project at
+`~/.claude/projects/<slug>/memory/*.md`. `scripts/claude_memory_import.py` files them where they will
+be used: files named `feedback*` become facts (they are about how to work, so they belong in the
+per-turn store), and everything else is copied into `~/.hermes/wikis/<project>/imported/` as a wiki
+page and indexed with the rest. The raw conversation transcripts next to them are left alone —
+hundreds of megabytes of logs is not knowledge.
+
 ## Requirements
 
 - Python 3.11 or newer
@@ -139,6 +212,21 @@ truncates longer input **silently**. This is why ingest splits text at 4500 char
 pages are split at headings.
 
 ## Backup and restore
+
+One command writes everything worth keeping into a git repository and commits it:
+
+```
+python scripts/backup.py                  # write, commit, do not push
+python scripts/backup.py --push           # push, if the window has pushing turned on
+```
+
+That repository holds every fact as readable text plus the numbers search compares, the wiki, each
+profile's `MEMORY.md` / `USER.md`, the fact store as JSON, the project map, and a short record of
+which profiles had which server registered. The Hermes config itself is deliberately **not** copied
+— it holds credentials, and a backup repository that ends up on a remote must never carry those.
+Pushing is off until it is turned on, and it refuses outright to push to a public repository.
+
+The pieces, if you want them separately:
 
 ```
 python scripts/export_store.py --out backup.jsonl
@@ -174,13 +262,27 @@ it out of any repository.
 
 ## Status
 
-Built and testable: the server (recall, learn, retire, stats, ingest), the status model that makes
-replacement and withdrawal reversible, the cross-project layer, project attribution from a file of
-paths, and the scripts for merging, migrating, exporting, restoring and comparing.
+Built and testable: the installer, the server (recall, learn, retire, stats, ingest), the status
+model that makes replacement and withdrawal reversible, the cross-project layer, project attribution
+from a file of paths, the Claude Code importer, the backup and review scripts, the scheduled jobs,
+the desktop window with its backend routes, and the scripts for merging, migrating, exporting,
+restoring and comparing. Covered by tests, and exercised against a copy of a real 380-node store.
 
-Not built yet: the installer, the part that retrieves memory before each message and mirrors the
-agent's own memory file, the desktop window, and the scheduled jobs. The layout above is the shape the
-rest will fit into.
+Known limits, stated rather than discovered later:
+
+- the fact half is Hermes's bundled provider, not this project — this project supplies the code and
+  written-page half;
+- that provider's automatic fact extraction (off by default) stores the *whole message* it matched
+  on, not a distilled fact, so a chatty week leaves near-duplicates behind; `fact_store` can remove
+  them;
+- its retrieval ranks by keyword, not by meaning, so a question worded differently from the note can
+  miss it;
+- merging notes into the written pages uses a small local model. It validates its own output before
+  writing and falls back to appending when the check fails, which happens on roughly a third of
+  pages. The fallback text is verbatim, including whatever phrasing the note was written with;
+- `scripts/migrate_to_cosine.py` (changing how distance is measured) is written but unproven: the
+  first attempt to test it compared two stores that measured distance differently, so the result
+  meant nothing. Do not trust it until it has been measured properly.
 
 ## Licence
 

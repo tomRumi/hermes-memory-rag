@@ -73,7 +73,7 @@ class TestStampOnWrite:
 
 class TestSupersedeKeepsHistory:
     def test_replaced_note_stops_being_returned_but_is_kept(self, store):
-        old = "the store lives at ~/harness-chroma"
+        old = "the store lives at ~/old-store-location"
         new = "the store lives at ~/hermes-rag"
         old_id = server.learn(old, kind="rag:gotcha", project="suptest")
 
@@ -200,11 +200,11 @@ class TestProjectAttribution:
         mapping = tmp_path / "projects.yaml"
         mapping.write_text(
             "- path: /code/site-a\n  project: site-a\n"
-            "- path: /code/_DevOps\n  project: devops\n",
+            "- path: /code/site-b\n  project: site-b\n",
             encoding="utf-8",
         )
         monkeypatch.setattr(server, "PROJECTS_FILE", mapping)
-        assert server._resolve_project("", cwd="/code/_DevOps/llm-selector") == "devops"
+        assert server._resolve_project("", cwd="/code/site-b/plugins") == "site-b"
         assert server._resolve_project("", cwd="/code/site-a/wp-content") == "site-a"
 
     def test_longest_prefix_wins_for_nested_projects(self, tmp_path, monkeypatch):

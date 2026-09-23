@@ -1,0 +1,12 @@
+{
+  "name": "hermes-memory-rag",
+  "label": "Memory",
+  "description": "What the memory store holds, with export, import, backup and the push setting.",
+  "icon": "Database",
+  "version": "0.1.0",
+  "tab": {
+    "label": "Memory",
+    "icon": "Database"
+  },
+  "api": "api.py"
+}

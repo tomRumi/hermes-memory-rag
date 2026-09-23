@@ -280,8 +280,15 @@ def _client() -> chromadb.PersistentClient:
 
 
 def _count(client: chromadb.PersistentClient, name: str) -> int:
+    """How many nodes a collection holds, without creating it.
+
+    get_or_create was used here, which meant merely ASKING how big a layer was
+    brought it into existence — so read-only calls (recall's global-layer check,
+    stats) left empty collections behind, and the review then listed phantom
+    projects. Nothing should be created except by a write.
+    """
     try:
-        return client.get_or_create_collection(name).count()
+        return client.get_collection(name).count()
     except Exception:
         return 0
 

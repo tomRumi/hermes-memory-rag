@@ -61,18 +61,21 @@ def inventory(client, slug: str, layers: dict[str, str]) -> dict:
         except Exception:
             counts[layer] = -1
 
-    staged = active = 0
+    # Same rule as the engine's own staging count, and deliberately the same
+    # shape: a copied-out version of this logic is how the two drifted apart once
+    # already (this one kept excluding learnings whose kind began with "memory",
+    # so it under-reported while the engine over-reported).
+    staged = 0
     if "memory" in layers:
         col = client.get_or_create_collection(layers["memory"])
         got = col.get(include=["metadatas"]) or {}
         for meta in got.get("metadatas") or []:
             meta = meta or {}
-            if str(meta.get("kind") or "").startswith("memory"):
+            if meta.get("source") == "memory_file":
                 continue
-            if (meta.get("status") or "active") == "active":
-                staged += 1
-            elif (meta.get("status") or "") == "active":
-                active += 1
+            if (meta.get("status") or "active") != "active":
+                continue
+            staged += 1
     return {"counts": counts, "staged": staged}
 
 

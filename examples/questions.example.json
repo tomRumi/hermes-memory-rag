@@ -1,0 +1,35 @@
+{
+  "note": "A question list for scripts/recall_score.py. Each question names one note that should answer it, and a marker: a short piece of text that appears only in that note. The score is the position the marker came back in, which is why the marker is checked against real content rather than a filename.",
+  "questions": [
+    {
+      "id": "facts-01",
+      "half": "facts",
+      "question": "Which database does the example project use?",
+      "answer": "the fact that says the example project runs on Postgres",
+      "marker": "Postgres 16"
+    },
+    {
+      "id": "facts-02",
+      "half": "facts",
+      "question": "Who signs off on a release?",
+      "answer": "the fact naming the release approver",
+      "marker": "release manager signs off"
+    },
+    {
+      "id": "wiki-01",
+      "half": "wiki",
+      "collection": "rag_acme__wiki",
+      "question": "How is the nightly import scheduled?",
+      "answer": "the page describing the import schedule",
+      "marker": "2am UTC"
+    },
+    {
+      "id": "code-01",
+      "half": "code",
+      "collection": "rag_acme__code",
+      "question": "Where is the retry limit set?",
+      "answer": "the file that defines the retry limit",
+      "marker": "MAX_RETRIES"
+    }
+  ]
+}

@@ -45,6 +45,8 @@ MAX_CHARS_PER_HIT = int(os.environ.get("HERMES_RAG_MAX_CHARS", "600"))
 # nomic-embed-text: 2048-token hard limit; ~2.5 chars/token for dense JSON.
 # 4500 chars ≈ 1800 tokens — safe margin under the context ceiling.
 CHUNK_CHAR_CAP = int(os.environ.get("HERMES_RAG_CHUNK_CHAR_CAP", "4500"))
+# Wiki text is prose, often Hungarian/accented: ~1.5-2 chars/token, so a lower cap.
+WIKI_CHUNK_CHAR_CAP = int(os.environ.get("HERMES_RAG_WIKI_CHUNK_CHAR_CAP", "2400"))
 
 # ── node status ───────────────────────────────────────────────────────────
 # Every node carries a status, and recall returns only live ones. A fact that has
@@ -254,6 +256,28 @@ def _cap_chunks(texts: list[str], max_chars: int = CHUNK_CHAR_CAP) -> list[str]:
         if text:
             out.append(text)
     return out
+
+def _wiki_chunks(text: str, max_chars: int = WIKI_CHUNK_CHAR_CAP) -> list[str]:
+    """Heading-aware chunks: a `##` section stays whole when it fits max_chars,
+    otherwise it is split on whitespace and the heading repeats on every piece
+    (the heading counts toward the budget)."""
+    out: list[str] = []
+    for i, part in enumerate(text.split("\n## ")):
+        if i > 0:
+            head, _, rest = part.partition("\n")
+            body, title = rest.strip(), head.strip()
+        else:
+            body, title = part.strip(), ""
+        if not body:
+            continue
+        prefix = f"## {title}\n" if title else ""
+        if len(prefix) + len(body) <= max_chars:
+            out.append(prefix + body)
+            continue
+        room = max(max_chars - len(prefix), 200)
+        out.extend(prefix + piece for piece in _cap_chunks([body], max_chars=room))
+    return out
+
 
 mcp = FastMCP("hermes-memory-rag")
 
@@ -718,30 +742,10 @@ def ingest_wiki(wiki_dir: str, project: str = "") -> str:
     from llama_index.core.schema import TransformComponent
     from llama_index.vector_stores.chroma import ChromaVectorStore
 
-    def _heading_chunks(text: str) -> list[str]:
-        parts = text.split("\n## ")
-        out = []
-        for i, part in enumerate(parts):
-            if i > 0:
-                head, _, rest = part.partition("\n")
-                body = rest.strip()
-                title = head.strip()
-            else:
-                body, title = part.strip(), ""
-            if not body:
-                continue
-            chunks = [f"## {title}\n{body}"] if title else [body]
-            for chunk in chunks:
-                while len(chunk) > 4000:
-                    out.append(chunk[:4000])
-                    chunk = "## " + title + "\n" + chunk[4000:]
-                out.append(chunk)
-        return out
-
     docs = []
     for p in files:
         text = p.read_text(encoding="utf-8", errors="replace")
-        for idx, chunk in enumerate(_heading_chunks(text)):
+        for idx, chunk in enumerate(_wiki_chunks(text)):
             docs.append(Document(
                 text=chunk,
                 metadata=_stamp(
@@ -771,7 +775,13 @@ def ingest_wiki(wiki_dir: str, project: str = "") -> str:
 
 
 def main() -> None:
-    mcp.run()
+    # stdio by default; HERMES_RAG_TRANSPORT=streamable-http runs ONE shared server
+    # (single writer to the Chroma store) that every agent connects to over HTTP.
+    transport = os.environ.get("HERMES_RAG_TRANSPORT", "stdio")
+    if transport != "stdio":
+        mcp.settings.host = os.environ.get("HERMES_RAG_HOST", "127.0.0.1")
+        mcp.settings.port = int(os.environ.get("HERMES_RAG_PORT", "8765"))
+    mcp.run(transport=transport)
 
 
 if __name__ == "__main__":

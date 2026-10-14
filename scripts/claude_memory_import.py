@@ -22,18 +22,18 @@ code layer already indexes.
 
 Dry run by default. Idempotent: a file whose content has not changed is skipped.
 
-Run with the Hermes interpreter (it has the provider on its path):
-
-    ~/.hermes/hermes-agent/venv/bin/python scripts/claude_memory_import.py
-    ~/.hermes/hermes-agent/venv/bin/python scripts/claude_memory_import.py --apply
+The scheduled wrapper provisions NumPy with uv for the selected Python.
 """
 
 from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib
+import os
 import re
 import sys
+import types
 from pathlib import Path
 
 DEFAULT_CLAUDE_ROOT = Path.home() / ".claude" / "projects"
@@ -104,12 +104,34 @@ def find_projects(claude_root: Path) -> list[tuple[str, Path]]:
 
 
 def import_store_module(home: Path):
-    for candidate in (home / "hermes-agent", Path.home() / ".hermes" / "hermes-agent"):
-        if (candidate / "plugins" / "memory" / "holographic" / "store.py").exists():
-            sys.path.insert(0, str(candidate))
-            from plugins.memory.holographic.store import MemoryStore  # type: ignore
-            return MemoryStore
-    return None
+    """Load the installed store's own files, not the Hermes app or its site-packages.
+
+    Current Hermes discovers bundled plugins before user plugins; loading the
+    provider entry module here would import the whole app and its private deps.
+    A synthetic package lets store.py resolve its relative imports without that.
+    """
+    shared = Path.home() / ".hermes"
+    override = os.environ.get("HERMES_RAG_HERMES_SOURCE")
+    core = Path(override) if override else next(
+        (candidate for candidate in (home / "hermes-agent", shared / "hermes-agent")
+         if (candidate / "hermes_state_wal.py").is_file()), home / "hermes-agent")
+    if not (core / "hermes_state_wal.py").is_file():
+        raise RuntimeError(f"Hermes source helpers missing at {core}; cannot open holographic store")
+    # Hermes source is pure Python here; never add its venv/site-packages. The
+    # provider calls its own journal policy and migration helpers when opening.
+    sys.path.insert(0, str(core))
+    candidates = (home / "hermes-agent/plugins/memory/holographic",
+                  home / "plugins/holographic",
+                  shared / "hermes-agent/plugins/memory/holographic",
+                  shared / "plugins/holographic")
+    for candidate in candidates:
+        if (candidate / "store.py").is_file():
+            package = types.ModuleType("_claude_import_holographic")
+            package.__path__ = [str(candidate)]
+            sys.modules[package.__name__] = package
+            return importlib.import_module(f"{package.__name__}.store").MemoryStore
+    raise RuntimeError(f"holographic fact-store plugin not installed under {home}; "
+                       "refusing to skip Claude feedback facts")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -131,15 +153,22 @@ def main(argv: list[str] | None = None) -> int:
         print(f"no Claude Code memory found under {claude_root} — nothing to do")
         return 0
 
-    MemoryStore = import_store_module(home)
-    store = MemoryStore(db_path=home / "memory_store.db") if MemoryStore else None
+    # Use one input snapshot for both the provider preflight and the writes.
+    # A source can change or disappear while the provider is being opened.
+    sources = [(slug, [(source, source.read_text(encoding="utf-8", errors="replace"))
+                       for source in sorted(memory.glob("*.md"))])
+               for slug, memory in projects]
+    feedback = any(FEEDBACK_FILE.match(source.name) and body.strip()
+                   for _, files in sources for source, body in files)
+    MemoryStore = import_store_module(home) if feedback else None
+    store = MemoryStore(db_path=home / "memory_store.db") if MemoryStore and args.apply else None
 
     facts_before = store._conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0] if store else 0
     facts_added = 0
     copied = updated = skipped = 0
     unmapped = []
 
-    for slug, memory_dir in projects:
+    for slug, files in sources:
         project = slugs.get(slug)
         if project is None:
             unmapped.append(slug)
@@ -147,15 +176,15 @@ def main(argv: list[str] | None = None) -> int:
         print(f"\n{slug}  ->  project {project!r}")
         target_dir = wiki_root / project / "imported"
 
-        for source in sorted(memory_dir.glob("*.md")):
+        for source, body in files:
             # Compare and write the same bytes: comparing stripped text against
             # copied text made every file look changed, so every run rewrote all
             # of them and nothing was ever reported as unchanged.
-            body = source.read_text(encoding="utf-8", errors="replace")
             if not body.strip():
                 continue
-            if FEEDBACK_FILE.match(source.name) and store is not None:
-                store.add_fact(body.strip()[:400], category="user_pref")
+            if FEEDBACK_FILE.match(source.name):
+                if store is not None:
+                    store.add_fact(body.strip()[:400], category="user_pref")
                 facts_added += 1
                 print(f"   fact   {source.name}")
                 continue

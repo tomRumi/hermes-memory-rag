@@ -7,13 +7,13 @@
 # "all good" message would train the reader to ignore it.
 
 set -uo pipefail
-
 REPO="__REPO__"
-PY="__SERVER_PY__"
+source "$REPO/scripts/jobs/python_runtime.sh"
+prepare_python_runtime || exit $?
 BACKUP_DIR="$HOME/.hermes/memory-backup"
 STORE="$HOME/hermes-rag"
 
-OUT="$("$PY" "$REPO/scripts/backup.py" --dir "$BACKUP_DIR" --store "$STORE" 2>&1)"
+OUT="$(run_memory_python "${HERMES_RAG_SERVER_DEP:-$REPO}" "$REPO/scripts/backup.py" --dir "$BACKUP_DIR" --store "$STORE" 2>&1)"
 STATUS=$?
 
 if [ $STATUS -ne 0 ]; then

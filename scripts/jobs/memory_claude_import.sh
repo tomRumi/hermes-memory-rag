@@ -6,54 +6,80 @@
 # changed — and it stays silent then, because a daily "nothing to do" message is
 # noise. It speaks up when pages or facts were added, or when it fails.
 #
-# Two interpreters on purpose: the importer touches the fact store, which lives
-# inside Hermes, so it runs with Hermes's Python. Re-indexing touches the vector
-# library, which deliberately does NOT live inside Hermes, so it runs with the
-# server's own Python. Copying pages without re-indexing them leaves files that
-# nothing can find, which is why the second step is here and not left to memory.
+# The selected interpreter runs with uv-managed, isolated dependencies for each
+# step. Copying pages without re-indexing leaves files that nothing can find.
 
 set -uo pipefail
-
 REPO="__REPO__"
-HERMES_PY="__HERMES_PY__"
-SERVER_PY="__SERVER_PY__"
+source "$REPO/scripts/jobs/python_runtime.sh"
 LOG_DIR="$HOME/.hermes/memory-backup"
+PENDING="$LOG_DIR/claude-reindex.pending"
 
-OUT="$("$HERMES_PY" "$REPO/scripts/claude_memory_import.py" --apply 2>&1)"
-STATUS=$?
+if [ "$#" -gt 1 ] || { [ "$#" -eq 1 ] && [ "$1" != "--reindex-only" ]; }; then
+  echo "Usage: $0 [--reindex-only]" >&2
+  exit 2
+fi
+prepare_python_runtime || exit $?
 
 mkdir -p "$LOG_DIR"
-{
-  echo "=== $(date '+%Y-%m-%d %H:%M') ==="
-  echo "$OUT"
-} >> "$LOG_DIR/claude-import.log"
+ADDED=0 UPDATED=0 FACTS=0
+if [ "${1:-}" != "--reindex-only" ]; then
+  OUT="$(run_memory_python numpy "$REPO/scripts/claude_memory_import.py" --apply 2>&1)"
+  STATUS=$?
+  {
+    echo "=== $(date '+%Y-%m-%d %H:%M') ==="
+    echo "$OUT"
+  } >> "$LOG_DIR/claude-import.log"
 
-if [ $STATUS -ne 0 ]; then
-  echo "Claude Code memory import FAILED (exit $STATUS):"
-  echo "$OUT" | tail -15
-  exit $STATUS
+  if [ $STATUS -ne 0 ]; then
+    echo "Claude Code memory import FAILED (exit $STATUS):"
+    echo "$OUT" | tail -15
+    exit $STATUS
+  fi
+
+  ADDED="$(echo "$OUT" | grep -o 'wiki pages added: *[0-9]*' | grep -o '[0-9]*$' | head -1)"
+  UPDATED="$(echo "$OUT" | grep -o 'wiki pages updated: *[0-9]*' | grep -o '[0-9]*$' | head -1)"
+  FACTS="$(echo "$OUT" | grep -o 'facts added: *[0-9]*' | grep -o '[0-9]*$' | head -1)"
+
+  # Keep a durable reminder if the indexer fails after the importer wrote pages.
+  if [ "${ADDED:-0}" -gt 0 ] || [ "${UPDATED:-0}" -gt 0 ]; then
+    touch "$PENDING" || exit 1
+  fi
+  if [ "${ADDED:-0}" -eq 0 ] && [ "${UPDATED:-0}" -eq 0 ] && \
+     [ "${FACTS:-0}" -eq 0 ] && [ ! -e "$PENDING" ]; then
+    exit 0
+  fi
 fi
 
-ADDED="$(echo "$OUT" | grep -o 'wiki pages added: *[0-9]*' | grep -o '[0-9]*$' | head -1)"
-UPDATED="$(echo "$OUT" | grep -o 'wiki pages updated: *[0-9]*' | grep -o '[0-9]*$' | head -1)"
-FACTS="$(echo "$OUT" | grep -o 'facts added: *[0-9]*' | grep -o '[0-9]*$' | head -1)"
-
-if [ "${ADDED:-0}" -eq 0 ] && [ "${UPDATED:-0}" -eq 0 ] && [ "${FACTS:-0}" -eq 0 ]; then
-  # Nothing changed, so nothing needs re-indexing either.
-  exit 0
-fi
-
-REINDEX="$("$SERVER_PY" "$REPO/scripts/reindex_wiki.py" 2>&1)"
+REINDEX="$(run_memory_python "${HERMES_RAG_SERVER_DEP:-$REPO}" "$REPO/scripts/reindex_wiki.py" 2>&1)"
 RSTATUS=$?
 echo "$REINDEX" >> "$LOG_DIR/claude-import.log"
 
+if [ $RSTATUS -eq 0 ] && [ -e "$PENDING" ] && \
+   ! echo "$REINDEX" | grep -Eq 'page\(s\) ->'; then
+  REINDEX="$REINDEX
+No indexed pages reported; leaving re-index pending."
+  RSTATUS=1
+fi
 if [ $RSTATUS -ne 0 ]; then
-  echo "Claude Code memory: $ADDED new page(s), $UPDATED updated, $FACTS fact(s)."
+  if [ "${1:-}" = "--reindex-only" ]; then
+    echo "Claude Code memory: recovery re-index of existing pages failed."
+  else
+    echo "Claude Code memory: $ADDED new page(s), $UPDATED updated, $FACTS fact(s)."
+  fi
   echo "Re-indexing FAILED — the pages are on disk but not searchable:"
   echo "$REINDEX" | tail -10
   exit $RSTATUS
 fi
 
-echo "Claude Code memory: $ADDED new page(s), $UPDATED updated, $FACTS fact(s). Indexed:"
+if [ -e "$PENDING" ]; then
+  rm "$PENDING" || exit 1
+fi
+
+if [ "${1:-}" = "--reindex-only" ]; then
+  echo "Claude Code memory: re-indexed existing wiki pages (import skipped). Indexed:"
+else
+  echo "Claude Code memory: $ADDED new page(s), $UPDATED updated, $FACTS fact(s). Indexed:"
+fi
 echo "$REINDEX" | grep -E 'page\(s\) ->' | sed 's/^/  /'
 exit 0

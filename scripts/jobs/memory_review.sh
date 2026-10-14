@@ -11,13 +11,13 @@
 # either from a session or from the desktop window.
 
 set -uo pipefail
-
 REPO="__REPO__"
-PY="__SERVER_PY__"
+source "$REPO/scripts/jobs/python_runtime.sh"
+prepare_python_runtime || exit $?
 BACKUP_DIR="$HOME/.hermes/memory-backup"
 STORE="$HOME/hermes-rag"
 
-OUT="$("$PY" "$REPO/scripts/weekly_review.py" --no-apply \
+OUT="$(run_memory_python "${HERMES_RAG_SERVER_DEP:-$REPO}" "$REPO/scripts/weekly_review.py" --no-apply \
         --store "$STORE" --out "$BACKUP_DIR/review.md" 2>&1)"
 STATUS=$?
 

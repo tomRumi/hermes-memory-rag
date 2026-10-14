@@ -190,11 +190,43 @@ These are three separate jobs rather than one do-everything job: a failure in th
 the backup, and each can be paused on its own. They run as scripts with no model involved
 (`--no-agent`), so they cost nothing and cannot invent anything.
 
-The jobs are shell wrappers under `~/.hermes/scripts/` (`scripts/jobs/*.sh` here, with the paths filled
-in at install time). A wrapper is needed because the two halves want different interpreters: the
-importer touches the fact store, which lives inside Hermes, while re-indexing touches the vector
-library, which deliberately lives outside it. **Copying pages without re-indexing them leaves files
-that nothing can find**, which is why the second step is part of the same job.
+The jobs are shell wrappers under `~/.hermes/scripts/` (`scripts/jobs/*.sh` here,
+with the repository path filled in at install time). They select `python3` on
+`PATH` when the job runs, or an explicit executable via `HERMES_RAG_PYTHON`:
+
+```sh
+HERMES_RAG_PYTHON=/path/to/python3.14 bash ~/.hermes/scripts/memory_claude_import.sh
+```
+
+Python 3.11+ is required (older versions fail before import). The wrapper
+uses `uv run --no-project --python "$HERMES_RAG_PYTHON" --with ...` to provision
+NumPy for the installed holographic fact store, and this repository's declared
+dependencies for indexing, backup, and review. These are uv-managed runtime
+environments for the selected interpreter, **not installs into that interpreter**
+or either old virtualenv. uv must be on `PATH` or set `HERMES_RAG_UV` to its
+executable. `PYTHONPATH`/`PYTHONHOME` are removed and Python runs with `-I`;
+the importer loads the installed provider's store and Hermes's pure-Python
+SQLite helpers from source, not their venv's packages. For a named
+`HERMES_HOME` profile, it uses that profile's wiki and fact database, and
+looks for Hermes source and the holographic plugin in the profile first,
+then in `~/.hermes`. `HERMES_RAG_HERMES_SOURCE` explicitly overrides source
+discovery. A missing provider aborts rather than discarding feedback.
+Package availability for future Python versions is determined by their wheels.
+**Copying pages without re-indexing them leaves files that nothing can find.**
+
+If a prior run copied pages but failed during re-index, the wrapper retains a
+`~/.hermes/memory-backup/claude-reindex.pending` marker and retries at the next
+daily run even when the importer reports no changes. It clears the marker only
+after the indexer reports indexed pages. To retry immediately without importing:
+
+```sh
+bash ~/.hermes/scripts/memory_claude_import.sh --reindex-only
+bash ~/.hermes/scripts/memory_backup.sh  # refresh the backup after indexing
+```
+
+The ordinary daily import skips re-indexing when no files or facts changed and
+no retry is pending; `--reindex-only` skips the importer and rebuilds the
+existing wiki layers.
 
 The daily jobs stay silent when there is nothing to say and print when something changed or failed
 (failures go to Telegram so a quiet job cannot fail invisibly). The weekly review speaks every time.

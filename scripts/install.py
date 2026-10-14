@@ -303,20 +303,13 @@ JOBS = [
 ]
 
 
-def write_job_scripts(home: Path, server_venv: Path, report: Report, dry_run: bool) -> None:
+def write_job_scripts(home: Path, report: Report, dry_run: bool) -> None:
     """Write the job wrappers into the directory Hermes runs job scripts from.
 
-    The wrappers exist because the two halves need different interpreters: the
-    importer touches the fact store (which lives inside Hermes), the re-index
-    touches the vector library (which deliberately does not). A shell wrapper is
-    the only place that can hold both.
+    The wrappers select Python at runtime and use uv's isolated dependencies:
+    the importer needs NumPy and the indexer needs this project's package.
     """
-    replacements = {
-        "__REPO__": str(REPO_ROOT),
-        "__SERVER_PY__": str(server_venv / "bin" / "python"),
-        "__HERMES_PY__": str(home / "hermes-agent" / "venv" / "bin" / "python"),
-        "__HERMES_HOME__": str(home),
-    }
+    replacements = {"__REPO__": str(REPO_ROOT)}
     target_dir = home / "scripts"
     for _, _, script_name, _, _ in JOBS:
         source = REPO_ROOT / "scripts" / "jobs" / script_name
@@ -516,7 +509,7 @@ def main(argv: list[str] | None = None) -> int:
     install_plugin(home, store_venv, store, backup_dir, report, args.dry_run)
 
     print("\nScheduled jobs")
-    write_job_scripts(home, store_venv, report, args.dry_run)
+    write_job_scripts(home, report, args.dry_run)
     register_jobs(home, report, args.dry_run)
 
     print("\nExisting memory entries")
@@ -541,8 +534,7 @@ def main(argv: list[str] | None = None) -> int:
     if not args.dry_run:
         print("\nNext: restart Hermes so it picks up the new server and provider, then run")
         print("  hermes memory status                 # the provider should say holographic")
-        print("  <hermes python> scripts/claude_memory_import.py --apply   # Claude Code's notes")
-        print("  <server python> scripts/reindex_wiki.py                   # and make them findable")
+        print("  bash ~/.hermes/scripts/memory_claude_import.sh  # import and index Claude notes")
         print("The scheduled jobs were registered above; `hermes cron list` shows them.")
     return 0
 

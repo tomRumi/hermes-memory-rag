@@ -16,6 +16,11 @@ Four things, in order of how much they matter:
    not in the store any more. This is how a rename leaves wrong details behind in
    the written knowledge, which is worse than leaving nothing.
 
+Also reported: unverified notes (an agent's claims nobody has confirmed) that have
+waited longer than HERMES_RAG_UNVERIFIED_REVIEW_DAYS (default 7). They are never
+merged into the pages and never counted as staged for a merge; the report only says
+they are waiting for someone to verify or retire them.
+
 Runs with the engine's interpreter (it needs the vector library):
 
     python scripts/weekly_review.py
@@ -41,6 +46,7 @@ LEGACY_STORE_RE = re.compile(r"~/[a-z0-9-]*chroma[a-z0-9-]*")
 # Two notes this close are worth a human look. Deliberately conservative: a false
 # candidate costs a sentence of reading, a missed one costs a stale wiki.
 CANDIDATE_DISTANCE = 0.35
+UNVERIFIED_REVIEW_DAYS = int(os.environ.get("HERMES_RAG_UNVERIFIED_REVIEW_DAYS", "7"))
 
 
 def projects(client) -> dict[str, dict[str, str]]:
@@ -77,6 +83,32 @@ def inventory(client, slug: str, layers: dict[str, str]) -> dict:
                 continue
             staged += 1
     return {"counts": counts, "staged": staged}
+
+
+def stale_unverified(client, name: str, days: int, now: float | None = None
+                     ) -> list[tuple[str, str, int]]:
+    """(id, start of the text, age in days) of unverified notes older than `days`,
+    oldest first. A note whose creation time cannot be read is reported as old: the
+    point is that someone should look at it."""
+    import calendar
+
+    now = time.time() if now is None else now
+    got = client.get_or_create_collection(name).get(include=["documents", "metadatas"])
+    found = []
+    for node_id, doc, meta in zip(got.get("ids") or [], got.get("documents") or [],
+                                  got.get("metadatas") or []):
+        meta = meta or {}
+        if meta.get("status") != "unverified":
+            continue
+        try:
+            created = calendar.timegm(time.strptime(str(meta.get("created")), "%Y-%m-%dT%H:%M:%SZ"))
+            age = int((now - created) // 86400)
+        except ValueError:
+            age = days + 1
+        if age > days:
+            found.append((node_id, (doc or "")[:110], age))
+    found.sort(key=lambda note: -note[2])
+    return found
 
 
 def supersede_candidates(client, name: str, embed, limit: int = 8) -> list[tuple[str, str, float]]:
@@ -229,6 +261,22 @@ def main(argv: list[str] | None = None) -> int:
             emit(f"  - {second}")
     if not any_candidates:
         emit("None found.")
+    emit()
+
+    emit(f"## Unverified notes waiting more than {UNVERIFIED_REVIEW_DAYS} days")
+    emit()
+    emit("Written by an agent and never confirmed. Verify them or retire them.")
+    emit()
+    any_unverified = False
+    for slug in sorted(found):
+        if "memory" not in found[slug]:
+            continue
+        for node_id, text, age in stale_unverified(
+                client, found[slug]["memory"], UNVERIFIED_REVIEW_DAYS):
+            any_unverified = True
+            emit(f"- **{slug}** #{node_id[:8]} ({age} days): {text}")
+    if not any_unverified:
+        emit("None.")
     emit()
 
     emit("## Names that no longer exist")

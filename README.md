@@ -44,17 +44,37 @@ Served over MCP as a server named `hermes-memory-rag`:
 
 ```python
 recall(query, project="", layer="auto", top_wiki=2, top_code=3, top_memory=1) -> str
-learn(text, kind="learning", project="", supersedes="") -> str
+learn(text, kind="learning", project="", supersedes="", status="", origin="") -> str
 retire(node_id, reason="", project="") -> str
+verify(node_id, project="", note="") -> str
 stats(project="") -> str
+list_projects() -> str
 ingest_code(root, project="", rebuild=True) -> str
 ingest_wiki(wiki_dir, project="") -> str
+reindex_wiki(wiki_dir, project="", mode="incremental", prune=True, dry_run=False,
+             exclude="", budget_seconds=60, allow_empty=False) -> str
 ```
 
 `recall` searches wiki, then code, then memory, and returns a bounded amount of text — two wiki
 sections, three code pieces and one learning by default, 600 characters each. If it returned more,
 every message would cost more. It also searches a cross-project layer last, labelled `[global]`, so a
 fact that applies everywhere is reachable without being filed under a project.
+
+`recall(query, project="*")` searches every project of the caller's namespace (never another
+namespace) and keeps the best hits per layer overall. Each hit is tagged with its project:
+
+```
+Recall [*] for: deploy lane
+[wiki@site deploy.md] ## Deploy the site deploys with the blue lane
+[code@api service.py] def deploy_lane(): ...
+[memory@site memory #c129e934 unverified] site deploy claim from an agent
+(1 unverified note(s): written by an agent, not yet confirmed; treat as a lead and verify before relying on it)
+```
+
+The `layer` argument works as usual, a layer with nothing anywhere prints `[wiki: not built for *]`,
+and it writes no usage-ledger row. `list_projects()` returns the caller's projects (slugs) with node
+counts per layer and unverified counts. Both are read-class, so a read-only token may use them.
+Calls without `"*"` print exactly what they always did.
 
 `learn` is idempotent: storing the same text twice changes nothing. When staging reaches ten notes
 it reports that a merge is due.
@@ -71,6 +91,7 @@ live ones:
 | `superseded` | something replaced it; `superseded_by` names the successor | `learn(..., supersedes=<id>)` |
 | `retired` | withdrawn; nothing replaced it | `retire(<id>, reason=...)` |
 | `archived` | moved out of the way when staging overflows | automatic, past the cap |
+| `unverified` | live, but an agent's claim nobody has confirmed; recall labels it | `learn(..., status="unverified")`, or a token that forces it |
 
 A replaced or withdrawn fact stays in the store with its text intact, so the change is reversible and
 you can still read what the earlier belief was. Recall prints a short id for memory hits — that is
@@ -106,6 +127,10 @@ All optional; the defaults are the ones above.
 | `HERMES_RAG_EDITOR_MODEL` | `granite4:3b` | the model that merges notes into the wiki |
 | `HERMES_RAG_TOKENS_FILE` | `~/.config/memory-rag/tokens.json` | bearer tokens accepted over HTTP (see below) |
 | `MEMORY_RAG_LOCAL_NAMESPACE` | `legacy` | namespace of the local caller (stdio, in-process scripts) |
+| `HERMES_RAG_TOKENS_DIR` | `tokens.d` beside the tokens file | the token directory (see below) |
+| `HERMES_RAG_NAMESPACES_FILE` | `namespaces.json` beside the tokens file | which folders a namespace may index (see below) |
+| `HERMES_RAG_RESERVED_NAMESPACES` | `vps-host` | comma list of namespaces the token directory may never vouch for (`legacy` always is) |
+| `HERMES_RAG_FOLDER_DENY` | empty | colon list of folders that may never be indexed, whatever a namespace allows |
 
 If your project keeps generated JSON indexes or caches in a directory of their own, add it to
 `HERMES_RAG_SKIP_JSON_DIRS`. They are worthless for searching and, because JSON is dense, a
@@ -117,7 +142,8 @@ Over stdio the caller is the local user and nothing is checked: it may write and
 in the namespace `MEMORY_RAG_LOCAL_NAMESPACE` names (default `legacy`; an invalid value is
 refused, not replaced). Served over HTTP
 (`HERMES_RAG_TRANSPORT=streamable-http`) every request needs
-`Authorization: Bearer <token>`, and the server will not start without a tokens file.
+`Authorization: Bearer <token>`, and the server will not start without a tokens file or a token
+directory (below).
 The file holds the sha256 of each token, never the token. It must be a regular file
 (not a symlink) owned by the server user with mode 0600, in a directory of mode 0700;
 otherwise every token is refused:
@@ -129,11 +155,12 @@ otherwise every token is refused:
 A token belongs to one namespace and everything it reads or writes lives inside it:
 collections become `rag_<namespace>.<project>__<layer>`, and the usage ledger is
 scoped the same way. The reserved namespace `legacy` is unprefixed, i.e. the store as
-it was before namespaces. `ingest` (default false) allows `ingest_code` / `ingest_wiki`,
-which read the server's disk and rebuild whole layers. `write` (default true, so older
+it was before namespaces. `ingest` (default false) allows `ingest_code` / `ingest_wiki` /
+`reindex_wiki`, which read the server's disk and change whole layers (and see "Which folders may be
+indexed"). `write` (default true, so older
 entries keep working) set to `false` makes a read-only token: it may call `recall` and
-`stats`, and every tool that changes the store (`learn`, `retire`, `ingest_code`,
-`ingest_wiki`) refuses it with "this token is read-only" before touching anything.
+`stats`, and every tool that changes the store (`learn`, `retire`, `verify`,
+`ingest_code`, `ingest_wiki`, `reindex_wiki`) refuses it with "this token is read-only" before touching anything.
 `"ingest": true` with `"write": false` contradicts itself: that entry is refused and
 logged, the rest of the file stays valid. A `write` that is not a JSON boolean (e.g.
 `"false"`) is malformed and, like any malformed entry, invalidates the whole file. The
@@ -149,6 +176,148 @@ To ingest a wiki into a namespace locally, e.g. `vps-host`:
 HERMES_RAG_STORE=/home/ubuntu/memory-store .venv/bin/python scripts/reindex_wiki.py \
     --wiki-root ~/.hermes/wikis --project my-project --namespace vps-host
 ```
+
+### Rights a token can carry
+
+Besides `namespace`, `ingest` and `write`, an entry (in the tokens file or a token file) may carry:
+
+- `"verify": true` (default false) lets the token call `verify`, which turns an unverified note into
+  an active one. Like `ingest` it needs `write`; the two contradict each other otherwise and that
+  entry is refused.
+- `"learn_status": "unverified"` forces every note the token learns to be unverified, whatever the
+  call asks for. An agent token should carry it; the token that confirms notes should not.
+
+## Unverified notes
+
+An agent's note is a claim. `learn(..., status="unverified")` (or a token with `learn_status`) stores
+it with `status: unverified`. It is live, so `recall` returns it, but labelled inside the bracket,
+after the id, and one footer line counts them:
+
+```
+[memory memory #1a2b3c4d unverified] the deploy lane is blue
+(1 unverified note(s): written by an agent, not yet confirmed; treat as a lead and verify before relying on it)
+```
+
+Active notes and wiki or code hits print exactly as before. `verify(node_id)` (a token with the
+`verify` right, or the local owner) promotes a note to `active` and records `verified_at`,
+`verified_by` and an optional note. Learning the exact text of an existing unverified note promotes
+it only for a caller that may verify and passes `status="active"`; an active note is never demoted.
+`origin` (at most 80 characters) records who wrote a note. Unverified notes count toward the staging
+cap (so they cannot pile up without bound). Past the cap the oldest *unverified* notes are archived
+first, and active notes only for whatever excess remains, so an agent that writes a lot can only
+push out its own unconfirmed claims, are never
+merged into the wiki by `scripts/consolidate.py`, and `scripts/weekly_review.py` lists the ones
+waiting longer than `HERMES_RAG_UNVERIFIED_REVIEW_DAYS` (default 7). `stats` reports
+`unverified_notes`.
+
+## Provisioning tokens: the token directory
+
+A provisioner (the Paperclip plugin, for one) should not edit the operator's `tokens.json`. It
+writes one file per namespace into the token directory instead, `tokens.d/` beside the tokens file
+(`HERMES_RAG_TOKENS_DIR` overrides it). Create it once, no root needed:
+
+```bash
+install -d -m700 ~/.config/memory-rag/tokens.d
+```
+
+Format v1, one file `<namespace>.json` (mode 600) per namespace:
+
+```json
+{"version": 1,
+ "namespace": "acme",
+ "tokens": {
+   "<sha256 of the agent token>": {"write": true, "ingest": false, "verify": false, "learn_status": "unverified"},
+   "<sha256 of the admin token>": {"write": true, "ingest": true, "verify": true}
+ },
+ "allowed_folders": ["/srv/acme/llm-wiki"]}
+```
+
+**Writer protocol.** Write the new content to a dotfile in the same directory, `.acme.json.tmp`
+(mode 600), then `rename` it onto `acme.json`. Anything that does not look like `<name>.json`
+(dotfiles, `*.tmp`, other suffixes) is ignored, so a half-written file is never read. Adding a
+company is writing its file, rotating a token is rewriting it, revoking is deleting it; nobody
+reads, edits and writes back a shared file. The server looks again on every call, so all three take
+effect at once, even inside an open session. Keep the plaintext tokens in the provisioner's own
+state; only digests go here.
+
+What the server enforces: the directory must be a real directory (not a link) owned by the server
+user, mode 700; each file a regular file (not a link), same owner, mode 600. The file stem must
+equal `namespace`, which must be valid and **not reserved**: `legacy` always, plus
+`HERMES_RAG_RESERVED_NAMESPACES` (default `vps-host`). A reserved namespace's tokens can only come
+from the operator's own tokens file, so no provisioner bug or web request can mint a host token;
+add the host's token to `tokens.json` by hand. A malformed file (unknown key, wrong type, version
+other than 1, more than 8 tokens) is ignored and logged without touching other files; at most 200
+files are read. A digest claimed under two namespaces is refused everywhere; on the same namespace
+the tokens file wins. A broken `tokens.json` refuses every token, directory included.
+`ingest` and `verify` need `write`; `ingest` is granted only if the file lists `allowed_folders`.
+
+The server starts over HTTP with only the token directory (even empty), so a fresh install can be
+provisioned later. With neither a tokens file nor the directory it still refuses to start.
+
+**What this does not protect against.** The provisioner and the server normally run as the same unix
+user. These rules stop mistakes, agents and web-page requests; they cannot stop code already running
+as that user, which can write any file the server trusts. Do not count on them against it.
+
+## Which folders may be indexed
+
+`ingest_code`, `ingest_wiki` and `reindex_wiki` read the server's own disk, so the `ingest` right
+alone would let a token index any file the service user can read. Give a namespace a list of folders
+in the operator's `namespaces.json` (`HERMES_RAG_NAMESPACES_FILE`; same ownership and mode rules as
+the tokens file, re-read when it changes):
+
+```json
+{"vps-host": {"allowed_folders": ["/home/me/wikis", "/home/me/code"]},
+ "factory-lab": {"allowed_folders": []}}
+```
+
+A path is accepted only if its **real** path (links and `..` resolved) is one of those folders or
+inside one, compared by whole path components. The check runs first on every index path, before
+anything is read or deleted, and the error does not list the folders. Rules:
+
+- a namespace with an entry here is capped by it; a token file's own `allowed_folders` count only
+  where they lie inside that list;
+- a namespace with a token file always has a list, empty (nothing may be indexed) unless the file
+  says otherwise;
+- a namespace with neither is **unrestricted**, as before this existed. Add an entry for `vps-host`
+  and any other namespace whose token has `ingest`;
+- an entry with an empty list indexes nothing; an unusable `namespaces.json` refuses all indexing
+  until fixed;
+- never allowed, whatever the lists say: the store, the directories holding the tokens file, the
+  token directory and `namespaces.json`, anything in `HERMES_RAG_FOLDER_DENY`, and `/` or your home
+  directory as an allowed folder. A walk from a folder above them does not enter them.
+
+Inside a folder, links never lead out: a directory link is not entered, a file link is read only if
+its real target is inside the folder (otherwise it is skipped and reported), and the file is opened
+without following a link at the last step. `ingest_code` and `ingest_wiki` also no longer delete a
+layer before finding anything to index: an empty or mistyped folder leaves the layer alone. The
+local scripts are checked too whenever their namespace has an entry.
+
+## Re-indexing a wiki folder in place
+
+`ingest_wiki` rebuilds a layer from scratch. `reindex_wiki` keeps it in step with a folder instead:
+
+```bash
+# over MCP: reindex_wiki(wiki_dir="/srv/acme/llm-wiki", project="llm-wiki", exclude="raw")
+.venv/bin/python scripts/reindex_wiki.py --incremental --prune --project llm-wiki --namespace acme
+```
+
+Node ids are derived from the folder, the page, the position and the text, so unchanged pages cost
+a hash and no embedding, an edited page replaces its own chunks (new vectors are stored before old
+ones go), and repeated or interrupted runs converge. `prune` (default) removes pages that are gone
+or can no longer be read safely. Only nodes this tool wrote for this folder are touched; pages
+`ingest_wiki` put in the same project stay. `mode="incremental"` (default) stops starting
+pages after `budget_seconds` and answers `partial: true` with `remaining`; call again to continue
+(at least one page is done per call). `mode="full"` re-embeds every page and runs to completion. A folder with no pages while the index holds some from it is refused (an unmounted
+disk must not empty the index); `mode="full", prune=true, allow_empty=true` does it on purpose.
+`exclude` is a comma list of top-level subfolders; hidden folders are always skipped.
+`dry_run` returns the plan and writes nothing. The tool is asynchronous and runs in a worker thread,
+so other namespaces keep being served; a second call for the same project while one runs answers
+`{"busy": true}`. It needs the `ingest` right and a folder the namespace may index. The answer is
+JSON with `files` (seen, unchanged, indexed, removed, skipped), `nodes` (added, deleted), `partial`,
+`remaining` and the first 20 `skipped` paths with a reason.
+
+`GET /healthz` answers `{"ok": true}` with no token, for a settings page or a supervisor. It says
+nothing about the store; the authenticated check is `stats`.
 
 ### Moving a namespace
 
@@ -272,6 +441,16 @@ be used: files named `feedback*` become facts (they are about how to work, so th
 per-turn store), and everything else is copied into `~/.hermes/wikis/<project>/imported/` as a wiki
 page and indexed with the rest. The raw conversation transcripts next to them are left alone —
 hundreds of megabytes of logs is not knowledge.
+
+## Run the tests
+
+```bash
+python3 -m venv .venv && .venv/bin/python -m pip install -e '.[test]' && .venv/bin/python -m pytest -q
+```
+
+The tests use temp directories and a built-in embedder: no Ollama, no real store, no tokens file and
+no port are touched. `tests/conftest.py` points the tokens file, token directory and `namespaces.json`
+at temp paths for every test and fails any test that still opens or lists `~/.config/memory-rag`.
 
 ## Requirements
 

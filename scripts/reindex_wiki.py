@@ -11,6 +11,7 @@ Runs with the engine's interpreter:
     <venv>/bin/python scripts/reindex_wiki.py
     <venv>/bin/python scripts/reindex_wiki.py --project my-project
     <venv>/bin/python scripts/reindex_wiki.py --wiki-root DIR --project P --namespace vps-host
+    <venv>/bin/python scripts/reindex_wiki.py --incremental --prune --dry-run
 
 The layer lands in the namespace given by --namespace (it sets
 MEMORY_RAG_LOCAL_NAMESPACE for this in-process call); without it, in whatever that
@@ -20,11 +21,20 @@ HERMES_RAG_STORE at the store the server uses.
 Rebuilding is per project: only the pages that changed matter, and rebuilding all
 of them on a large install would be wasted work. Pass no --project to rebuild each
 project that has a wiki directory.
+
+By default each project's wiki layer is rebuilt from scratch (`ingest_wiki`).
+--incremental updates it in place instead (`reindex_wiki`, the same function the
+server offers as a tool): pages that did not change cost a hash and no embedding, an
+edited page replaces its own chunks, and --prune also removes pages that are gone
+from the folder. --dry-run prints the plan and writes nothing; --exclude takes a
+comma list of top-level subfolders to leave out. Either way the folder must be one
+the namespace may index (see namespaces.json in the README).
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -32,6 +42,23 @@ from pathlib import Path
 
 DEFAULT_WIKI_ROOT = Path(os.environ.get("HERMES_WIKI_ROOT",
                                         str(Path.home() / ".hermes" / "wikis")))
+
+
+def _reindex(server, directory: Path, name: str, args) -> str:
+    """Run the incremental update to completion (it works in time-boxed passes) and
+    summarise it in one line."""
+    while True:
+        report = json.loads(server.reindex_wiki_blocking(
+            str(directory), name, mode="incremental", prune=args.prune,
+            dry_run=args.dry_run, exclude=args.exclude, budget_seconds=300))
+        if report.get("busy"):
+            return "busy: another re-index of this project is running"
+        if not report["partial"]:
+            break
+    files, nodes = report["files"], report["nodes"]
+    return (f"{'would index' if args.dry_run else 'indexed'} {files['indexed']} page(s), "
+            f"{files['unchanged']} unchanged, {files['removed']} removed, "
+            f"{files['skipped']} skipped; nodes +{nodes['added']} -{nodes['deleted']}")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -42,7 +69,17 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--namespace", default="",
                     help="namespace to write into, e.g. vps-host (default: "
                          "$MEMORY_RAG_LOCAL_NAMESPACE, else legacy)")
+    ap.add_argument("--incremental", action="store_true",
+                    help="update the layer in place instead of rebuilding it")
+    ap.add_argument("--prune", action="store_true",
+                    help="with --incremental: remove pages that are gone from the folder")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="with --incremental: print the plan, write nothing")
+    ap.add_argument("--exclude", default="",
+                    help="with --incremental: comma list of top-level subfolders to skip")
     args = ap.parse_args(argv)
+    if not args.incremental and (args.prune or args.dry_run or args.exclude):
+        ap.error("--prune, --dry-run and --exclude need --incremental")
 
     from hermes_memory_rag import server
 
@@ -81,7 +118,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  {name}: no pages, skipped")
             continue
         try:
-            result = server.ingest_wiki(str(directory), name)
+            if args.incremental:
+                result = _reindex(server, directory, name, args)
+            else:
+                result = server.ingest_wiki(str(directory), name)
             print(f"  {name}: {pages} page(s) -> {result}")
         except Exception as exc:  # noqa: BLE001 - report, do not crash the job
             print(f"  {name}: FAILED ({exc})")

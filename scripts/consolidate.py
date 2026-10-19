@@ -46,7 +46,12 @@ def _slugify(project: str) -> str:
 
 
 def _staging_nodes(project: str) -> dict[str, dict]:
-    """id -> {text, kind, created} from the staging collection."""
+    """id -> {text, kind, created} of the notes that may be merged into the wiki.
+
+    Only active notes qualify. An unverified note is an agent's unconfirmed claim and
+    must not be written into the pages as knowledge (and the merge deletes its
+    sources); one that was replaced, withdrawn or archived is not current either. A
+    note with no status predates the field and counts as active."""
     names = {
         "memory": f"rag_{_slugify(project)}__memory",
     }
@@ -54,6 +59,8 @@ def _staging_nodes(project: str) -> dict[str, dict]:
     data = col.get(include=["documents", "metadatas"])
     nodes = {}
     for i, doc, meta in zip(data["ids"], data["documents"], data["metadatas"]):
+        if ((meta or {}).get("status") or "active") != "active":
+            continue
         nodes[i] = {
             "text": (doc or "").strip(),
             "kind": str((meta or {}).get("kind", "learning")),

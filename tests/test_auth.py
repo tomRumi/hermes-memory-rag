@@ -478,6 +478,9 @@ def _tool_arguments(wiki):
         "retire": {"node_id": server._det_id("mem", NOTE)[:8], "project": "shared"},
         "ingest_code": {"root": str(wiki), "project": "shared"},
         "ingest_wiki": {"wiki_dir": str(wiki), "project": "shared"},
+        "reindex_wiki": {"wiki_dir": str(wiki), "project": "shared"},
+        "list_projects": {},
+        "verify": {"node_id": server._det_id("mem", NOTE)[:8], "project": "shared"},
     }
 
 

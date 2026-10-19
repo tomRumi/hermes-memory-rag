@@ -15,6 +15,12 @@ Tools exposed to every Hermes session (any profile, any project):
 Session-end procedure (encoded in the `project-memory` skill): deposit
 learnings via `learn`; check `stats` for the wiki-earn suggestion.
 
+Access control (HTTP transport only): every request must carry a bearer token
+whose sha256 is listed in the tokens file. A token maps to one namespace; every
+collection and ledger row it touches is confined to that namespace, ingest_* is
+refused unless the token is explicitly allowed it, and a read-only token may call
+only the tools that change nothing. See `_caller` and TOOL_ACCESS below.
+
 Design invariants:
 - embed-before-store; nothing reaches Chroma without a vector
 - deterministic IDs → idempotent upserts
@@ -25,13 +31,19 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import sqlite3
+import stat
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import chromadb
+from mcp.server.auth.middleware.auth_context import get_access_token
+from mcp.server.auth.provider import AccessToken
+from mcp.server.auth.settings import AuthSettings
 from mcp.server.fastmcp import FastMCP
 
 STORE_DIR = Path(
@@ -72,6 +84,179 @@ GLOBAL_PROJECT = "global"
 # starting with "memory", which silently swallowed legitimate learnings filed as
 # "memory:decision" — they were stored, never merged, and nothing said so.
 MIRROR_SOURCE = "memory_file"
+
+# ── who is calling? ───────────────────────────────────────────────────────
+# Served over HTTP the store is shared by several companies, so a request must
+# prove who it is. The tokens file maps the sha256 of a bearer token to a
+# namespace (never the token itself):
+#
+#   {"<sha256 hex>": {"namespace": "acme", "ingest": false, "write": true}, ...}
+#
+# A namespace scopes everything a token can read or write. The reserved
+# namespace "legacy" is unprefixed: it is the store as it was before namespaces
+# existed, so existing data stays reachable under it. `ingest` (default false)
+# lets a token run ingest_code / ingest_wiki, which read the server's own disk
+# and rebuild whole layers; agent tokens should not have it. `write` (default
+# true, so entries written before it existed keep working) set to false makes a
+# read-only token: it may call the read tools in TOOL_ACCESS and nothing else.
+# "ingest": true with "write": false contradicts itself; that entry is refused
+# (fail closed) and logged, while the file's other entries stay valid. A `write`
+# that is present but not a JSON boolean is malformed and rejects the whole file,
+# like any other malformed entry: "false" as a string must never mean writable.
+#
+# Fail closed: a missing, unreadable, group/world-accessible or malformed file
+# means no token is valid. Over stdio (or an in-process call from a script) there
+# is no network peer, so the caller is the local process owner: ingest and write
+# allowed, in the namespace named by MEMORY_RAG_LOCAL_NAMESPACE (default "legacy",
+# as before namespaces existed). That lets an operator ingest straight into, say,
+# "vps-host". The variable is read on every call; a value that is not a valid
+# namespace is refused, never quietly replaced by "legacy".
+
+LEGACY_NAMESPACE = "legacy"
+LOCAL_NAMESPACE_ENV = "MEMORY_RAG_LOCAL_NAMESPACE"
+TOKENS_FILE = Path(os.environ.get(
+    "HERMES_RAG_TOKENS_FILE", str(Path.home() / ".config" / "memory-rag" / "tokens.json")))
+_NAMESPACE_RE = re.compile(r"[a-z0-9]+(-[a-z0-9]+)*")
+_log = logging.getLogger("hermes_memory_rag")
+
+
+def _valid_namespace(namespace: object) -> bool:
+    return (isinstance(namespace, str) and len(namespace) <= 40
+            and _NAMESPACE_RE.fullmatch(namespace) is not None)
+
+
+@dataclass(frozen=True)
+class Caller:
+    namespace: str
+    ingest: bool
+    write: bool = True
+
+
+def _read_tokens(path: Path) -> dict[str, Caller]:
+    """sha256 hex -> Caller from the tokens file. Raises ValueError if it is unfit.
+
+    One malformed entry rejects the whole file: half-trusting a file nobody has
+    reviewed is how a typo becomes an open door. A well-formed entry that asks for
+    ingest without write is contradictory; only that entry is refused.
+    """
+    try:
+        # Open without following a symlink, and judge the file we actually hold.
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            st = os.fstat(fd)
+            with os.fdopen(fd, encoding="utf-8") as fh:
+                fd = -1
+                raw = json.load(fh)
+        finally:
+            if fd >= 0:
+                os.close(fd)
+        parent = os.lstat(path.parent)
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"cannot read tokens file {path}: {exc}") from exc
+    # Whoever can replace the file or its directory decides who may call.
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & 0o077:
+        raise ValueError(f"tokens file {path} must be a regular file owned by the server user, mode 600")
+    if not stat.S_ISDIR(parent.st_mode) or parent.st_uid != os.geteuid() or parent.st_mode & 0o077:
+        raise ValueError(f"directory of tokens file {path} must be a real directory (not a symlink) owned by the server user, mode 700")
+    if not isinstance(raw, dict):
+        raise ValueError(f"tokens file {path} must be a JSON object")
+    tokens: dict[str, Caller] = {}
+    for digest, entry in raw.items():
+        namespace = entry.get("namespace") if isinstance(entry, dict) else None
+        if not re.fullmatch(r"[0-9a-f]{64}", digest) or not _valid_namespace(namespace):
+            raise ValueError(f"tokens file {path} has a malformed entry for {digest[:12]!r}")
+        write = entry.get("write", True)
+        if not isinstance(write, bool):
+            raise ValueError(f"tokens file {path} has a malformed entry for {digest[:12]!r}")
+        ingest = entry.get("ingest") is True
+        if ingest and not write:
+            # A contradiction, not a typo to guess around: neither right is granted.
+            _log.error("tokens file %s: entry %r has ingest without write — refusing "
+                       "that token", path, digest[:12])
+            continue
+        tokens[digest] = Caller(namespace, ingest, write)
+    return tokens
+
+
+class _FileTokenVerifier:
+    """Verifies bearer tokens against the tokens file, re-read when it changes so
+    a token can be added, revoked or changed without restarting the server."""
+
+    def __init__(self) -> None:
+        self._key: tuple | None = None
+        self._tokens: dict[str, Caller] = {}
+
+    def _current(self) -> dict[str, Caller]:
+        try:
+            st, parent = os.lstat(TOKENS_FILE), os.lstat(TOKENS_FILE.parent)
+            key = (TOKENS_FILE, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns,
+                   parent.st_ino, parent.st_ctime_ns)  # the directory's mode is judged too
+        except OSError:
+            self._key, self._tokens = None, {}
+            return self._tokens
+        if key != self._key:
+            try:
+                self._tokens = _read_tokens(TOKENS_FILE)
+            except ValueError as exc:
+                _log.error("%s — refusing every token", exc)
+                self._tokens = {}
+            self._key = key
+        return self._tokens
+
+    async def verify_token(self, token: str) -> AccessToken | None:
+        digest = hashlib.sha256(token.encode()).hexdigest()
+        caller = self._current().get(digest)
+        if caller is None:
+            return None
+        # client_id is what the SDK compares to keep a session with its creator, so
+        # it names the token, not just the namespace. What the token may do is not
+        # carried here: _caller asks the file again on every call.
+        return AccessToken(
+            token=digest, client_id=f"{caller.namespace}:{digest[:12]}", scopes=[])
+
+
+_verifier = _FileTokenVerifier()
+
+
+def _local_namespace() -> str:
+    """The namespace of the local process owner (stdio / in-process caller)."""
+    namespace = os.environ.get(LOCAL_NAMESPACE_ENV, "").strip() or LEGACY_NAMESPACE
+    if not _valid_namespace(namespace):
+        raise PermissionError(f"{LOCAL_NAMESPACE_ENV}={namespace!r} is not a valid namespace")
+    return namespace
+
+
+def _serving_remote() -> bool:
+    return os.environ.get("HERMES_RAG_TRANSPORT", "stdio") != "stdio"
+
+
+def _caller(*, write: bool = False) -> Caller:
+    """The authenticated caller of the tool now running; PermissionError if none.
+
+    A session lives longer than the request that opened it, so the token is looked
+    up again on every call: revoking it, or changing its namespace, ingest or write
+    right, takes effect at once, not when the session ends.
+
+    `write=True` is what every tool that changes the store passes, as its first
+    act, so a read-only token is turned away before anything is touched.
+    """
+    access = get_access_token()
+    if access is not None:
+        caller = _verifier._current().get(access.token)
+        if caller is None:
+            raise PermissionError("token no longer valid")
+    elif _serving_remote():
+        raise PermissionError("authentication required")
+    else:
+        caller = Caller(_local_namespace(), True, True)
+    if write and not caller.write:
+        raise PermissionError("this token is read-only: it may not change the store")
+    return caller
+
+
+def _require_ingest(caller: Caller) -> None:
+    if not caller.ingest:
+        raise PermissionError("this token may not run ingest_*")
 
 
 def _now() -> str:
@@ -279,7 +464,16 @@ def _wiki_chunks(text: str, max_chars: int = WIKI_CHUNK_CHAR_CAP) -> list[str]:
     return out
 
 
-mcp = FastMCP("hermes-memory-rag")
+_BASE_URL = "http://{}:{}".format(
+    os.environ.get("HERMES_RAG_HOST", "127.0.0.1"), os.environ.get("HERMES_RAG_PORT", "8765"))
+mcp = FastMCP(
+    "hermes-memory-rag",
+    token_verifier=_verifier,
+    # Only used by the HTTP transports. The server is its own resource server and
+    # validates tokens itself (there is no OAuth flow), hence no resource check.
+    auth=AuthSettings(issuer_url=_BASE_URL, resource_server_url=_BASE_URL,
+                      validate_token_resource=False),
+)
 
 # ── shared plumbing ───────────────────────────────────────────────────────
 
@@ -289,8 +483,15 @@ def _slugify(project: str) -> str:
     return slug or "default"
 
 
-def _collection_names(project: str) -> dict[str, str]:
+def _scope(project: str, namespace: str = LEGACY_NAMESPACE) -> str:
+    """The project's slug inside a namespace. Slugs hold only [a-z0-9-], so the
+    "." can never be forged by a project name and namespaces cannot collide."""
     slug = _slugify(project)
+    return slug if namespace == LEGACY_NAMESPACE else f"{namespace}.{slug}"
+
+
+def _collection_names(project: str, namespace: str = LEGACY_NAMESPACE) -> dict[str, str]:
+    slug = _scope(project, namespace)
     return {
         "code": f"rag_{slug}__code",
         "wiki": f"rag_{slug}__wiki",
@@ -377,17 +578,31 @@ def _ledger() -> sqlite3.Connection:
     return conn
 
 
-def _log_event(project: str, event: str, detail: str = "") -> None:
+def _log_event(project: str, event: str, detail: str = "",
+               namespace: str = LEGACY_NAMESPACE) -> None:
     conn = _ledger()
     with conn:
         conn.execute(
             "INSERT INTO events (ts, project, event, detail) VALUES (?,?,?,?)",
-            (time.time(), _slugify(project), event, detail[:500]),
+            (time.time(), _scope(project, namespace), event, detail[:500]),
         )
     conn.close()
 
 
 # ── tools ─────────────────────────────────────────────────────────────────
+# What each tool does to the store. A "write" tool calls _caller(write=True)
+# before anything else, so a read-only token is refused with no side effect.
+# "read" tools change no node and create no collection (recall and stats do add a
+# row to the usage ledger, which is what stats' suggestions are counted from).
+# Every registered tool must be listed; tests/test_auth.py fails otherwise.
+TOOL_ACCESS = {
+    "recall": "read",
+    "stats": "read",
+    "learn": "write",        # adds a note, may supersede or archive others
+    "retire": "write",       # changes a note's status
+    "ingest_code": "write",  # deletes and rebuilds the code layer (also needs ingest)
+    "ingest_wiki": "write",  # deletes and rebuilds the wiki layer (also needs ingest)
+}
 
 
 @mcp.tool()
@@ -398,12 +613,13 @@ def recall(query: str, project: str = "", layer: str = "auto",
     `project` defaults to whatever the projects file says the working directory
     belongs to, falling back to its name; `layer` = auto|wiki|code|memory."""
     project = _resolve_project(project)
-    names = _collection_names(project)
+    ns = _caller().namespace
+    names = _collection_names(project, ns)
     client = _client()
     embed = _embed_model()
 
     lines = [f"Recall [{project}] for: {query}"]
-    _log_event(project, "recall", query[:200])
+    _log_event(project, "recall", query[:200], ns)
 
     want = layer if layer != "auto" else None
 
@@ -433,7 +649,7 @@ def recall(query: str, project: str = "", layer: str = "auto",
     # comes first, and capped so it cannot crowd out project context. A project is
     # never silently read as the global one: this is a separate, labelled pass.
     if _wanted("memory") and _slugify(project) != GLOBAL_PROJECT:
-        gname = _collection_names(GLOBAL_PROJECT)["memory"]
+        gname = _collection_names(GLOBAL_PROJECT, ns)["memory"]
         if _count(client, gname):
             try:
                 ghits = [h for h in _search_collection(client, gname, query, top_memory * 3, embed)
@@ -458,18 +674,19 @@ def learn(text: str, kind: str = "learning", project: str = "",
     stops being returned, but is kept, so the change is reversible and you can
     still see what the earlier fact was. Use it instead of rewriting history."""
     project = _resolve_project(project)
+    ns = _caller(write=True).namespace
     text = text.strip()
     if not text:
         raise ValueError("refusing to store an empty learning")
     if len(text) > 500:
         text = text[:497] + "…"
 
-    names = _collection_names(project)
+    names = _collection_names(project, ns)
     client = _client()
     col = client.get_or_create_collection(names["memory"])
     node_id = _det_id("mem", text)
     if col.get(ids=[node_id])["ids"]:
-        _log_event(project, "learn_dup")
+        _log_event(project, "learn_dup", namespace=ns)
         return node_id  # idempotent
 
     embed = _embed_model()
@@ -493,7 +710,7 @@ def learn(text: str, kind: str = "learning", project: str = "",
             old = (col.get(ids=[target], include=["metadatas"])["metadatas"] or [{}])[0] or {}
             col.update(ids=[target], metadatas=[
                 {**old, "status": STATUS_SUPERSEDED, "superseded_by": node_id}])
-            _log_event(project, "supersede", f"{target}->{node_id}")
+            _log_event(project, "supersede", f"{target}->{node_id}", ns)
             note = f" || replaced {target[:8]}"
 
     # Backstop past the cap: the oldest notes are moved aside, never deleted. They
@@ -512,14 +729,14 @@ def learn(text: str, kind: str = "learning", project: str = "",
         for pid, meta in live[:max(0, overflow)]:
             col.update(ids=[pid], metadatas=[{**meta, "status": STATUS_ARCHIVED}])
         if overflow > 0:
-            _log_event(project, "archive", f"{overflow} of {len(live)} notes archived")
+            _log_event(project, "archive", f"{overflow} of {len(live)} notes archived", ns)
             note += f" || {overflow} oldest note(s) archived (kept, no longer returned)"
 
-    _log_event(project, "learn", kind)
+    _log_event(project, "learn", kind, ns)
 
     staged = _staging_count(col)
     result = node_id + note
-    if staged >= CONSOLIDATE_THRESHOLD:
+    if staged >= CONSOLIDATE_THRESHOLD and ns == LEGACY_NAMESPACE:  # the script knows no other
         result += (
             f" || CONSOLIDATION DUE: staging at {staged} >= "
             f"{CONSOLIDATE_THRESHOLD} — run scripts/consolidate.py {project} "
@@ -537,8 +754,9 @@ def retire(node_id: str, reason: str = "", project: str = "") -> str:
     `node_id` is the short id recall prints, or any unique prefix of it. An
     ambiguous or unknown reference changes nothing and says so."""
     project = _resolve_project(project)
+    ns = _caller(write=True).namespace
     client = _client()
-    col = client.get_or_create_collection(_collection_names(project)["memory"])
+    col = client.get_or_create_collection(_collection_names(project, ns)["memory"])
     target = _resolve_node_id(col, node_id.strip())
     if target is None:
         return (f"no single memory note matches {node_id!r} — nothing changed. "
@@ -548,7 +766,7 @@ def retire(node_id: str, reason: str = "", project: str = "") -> str:
         return f"{target[:8]} is already {meta.get('status')} — nothing changed"
     col.update(ids=[target], metadatas=[
         {**meta, "status": STATUS_RETIRED, "retired_reason": reason[:200]}])
-    _log_event(project, "retire", f"{target} {reason[:100]}")
+    _log_event(project, "retire", f"{target} {reason[:100]}", ns)
     return f"retired {target[:8]}" + (f" ({reason[:80]})" if reason else "")
 
 
@@ -558,10 +776,11 @@ def stats(project: str = "") -> str:
     (≥3 sessions AND ≥5 learnings) OR (≥3 architecture-phrased recalls) on a
     project with no wiki → suggest generating the wiki."""
     project = _resolve_project(project)
-    names = _collection_names(project)
+    ns = _caller().namespace
+    names = _collection_names(project, ns)
     client = _client()
     conn = _ledger()
-    slug = _slugify(project)
+    slug = _scope(project, ns)
 
     sessions = conn.execute(
         "SELECT COUNT(DISTINCT CAST(ts/86400 AS INT)) FROM events "
@@ -580,13 +799,16 @@ def stats(project: str = "") -> str:
     counts = {w: _count(client, names[w]) for w in names}
     # The cross-project layer is reported on its own: it is not this project's
     # memory, and lumping it in would make the counts lie.
-    global_memory = _count(client, _collection_names(GLOBAL_PROJECT)["memory"])
+    global_memory = _count(client, _collection_names(GLOBAL_PROJECT, ns)["memory"])
     has_wiki = counts["wiki"] > 0
     earned = (not has_wiki) and ((sessions >= 3 and learnings >= 5) or arch_recalls >= 3)
 
     # "memory" in layers counts every note ever stored, including replaced and
     # moved-aside ones. The number that drives merging is the live staging count.
-    staged = _staging_count(client.get_or_create_collection(names["memory"]))
+    try:  # never created by a read: a layer that does not exist has nothing staged
+        staged = _staging_count(client.get_collection(names["memory"]))
+    except Exception:
+        staged = 0
 
     report = {
         "project": project,
@@ -610,8 +832,11 @@ def ingest_code(root: str, project: str = "", rebuild: bool = True) -> str:
     """Index a repo's source files into the project's code layer.
     Skips vendored/binary/hidden dirs; deterministic IDs make unchanged
     chunks idempotent; rebuild=True drops stale chunks of edited files."""
+    caller = _caller(write=True)
+    _require_ingest(caller)
+    ns = caller.namespace
     project = project or os.path.basename(root.rstrip("/"))
-    names = _collection_names(project)
+    names = _collection_names(project, ns)
     client = _client()
     embed = _embed_model()
     _embedder_healthcheck(embed)
@@ -713,7 +938,7 @@ def ingest_code(root: str, project: str = "", rebuild: bool = True) -> str:
     if stored < len(final_nodes):
         raise RuntimeError(
             f"ingest incomplete: {stored} stored, {len(final_nodes)} expected")
-    _log_event(project, "ingest_code", f"{stored} nodes")
+    _log_event(project, "ingest_code", f"{stored} nodes", ns)
     return f"code layer [{project}]: {stored} nodes from {len(docs)} files"
 
 
@@ -721,8 +946,11 @@ def ingest_code(root: str, project: str = "", rebuild: bool = True) -> str:
 def ingest_wiki(wiki_dir: str, project: str = "") -> str:
     """(Re)index a code-wiki directory (markdown) into the project's wiki
     layer. Heading-aware chunking keeps `##` sections atomic."""
+    caller = _caller(write=True)
+    _require_ingest(caller)
+    ns = caller.namespace
     project = project or os.path.basename(wiki_dir.rstrip("/"))
-    names = _collection_names(project)
+    names = _collection_names(project, ns)
     client = _client()
     embed = _embed_model()
     _embedder_healthcheck(embed)
@@ -770,7 +998,7 @@ def ingest_wiki(wiki_dir: str, project: str = "") -> str:
     stored = col.count()
     if stored < len(docs):
         raise RuntimeError(f"wiki ingest incomplete: {stored}/{len(docs)}")
-    _log_event(project, "ingest_wiki", f"{stored} nodes")
+    _log_event(project, "ingest_wiki", f"{stored} nodes", ns)
     return f"wiki layer [{project}]: {stored} nodes"
 
 
@@ -779,6 +1007,14 @@ def main() -> None:
     # (single writer to the Chroma store) that every agent connects to over HTTP.
     transport = os.environ.get("HERMES_RAG_TRANSPORT", "stdio")
     if transport != "stdio":
+        # Fail closed: a shared server with nobody able to authenticate is a
+        # misconfiguration to stop on, not to serve through.
+        try:
+            tokens = _read_tokens(TOKENS_FILE)
+        except ValueError as exc:
+            raise SystemExit(f"refusing to serve over {transport}: {exc}") from exc
+        if not tokens:
+            raise SystemExit(f"refusing to serve over {transport}: no tokens in {TOKENS_FILE}")
         mcp.settings.host = os.environ.get("HERMES_RAG_HOST", "127.0.0.1")
         mcp.settings.port = int(os.environ.get("HERMES_RAG_PORT", "8765"))
     mcp.run(transport=transport)

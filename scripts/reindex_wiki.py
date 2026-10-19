@@ -10,6 +10,12 @@ Runs with the engine's interpreter:
 
     <venv>/bin/python scripts/reindex_wiki.py
     <venv>/bin/python scripts/reindex_wiki.py --project my-project
+    <venv>/bin/python scripts/reindex_wiki.py --wiki-root DIR --project P --namespace vps-host
+
+The layer lands in the namespace given by --namespace (it sets
+MEMORY_RAG_LOCAL_NAMESPACE for this in-process call); without it, in whatever that
+variable already says, and failing that in "legacy", the unprefixed layout. Point
+HERMES_RAG_STORE at the store the server uses.
 
 Rebuilding is per project: only the pages that changed matter, and rebuilding all
 of them on a large install would be wasted work. Pass no --project to rebuild each
@@ -33,9 +39,25 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--wiki-root", default=str(DEFAULT_WIKI_ROOT))
     ap.add_argument("--project", action="append", default=[],
                     help="project to rebuild (repeatable; default: every wiki directory)")
+    ap.add_argument("--namespace", default="",
+                    help="namespace to write into, e.g. vps-host (default: "
+                         "$MEMORY_RAG_LOCAL_NAMESPACE, else legacy)")
     args = ap.parse_args(argv)
 
     from hermes_memory_rag import server
+
+    if args.namespace:
+        if not server._valid_namespace(args.namespace):
+            print(f"--namespace {args.namespace!r} is not a valid namespace "
+                  f"(lowercase letters, digits and single hyphens, at most 40)")
+            return 2
+        os.environ[server.LOCAL_NAMESPACE_ENV] = args.namespace
+    try:
+        namespace = server._local_namespace()
+    except PermissionError as exc:
+        print(exc)
+        return 2
+    print(f"namespace: {namespace}")
 
     wiki_root = Path(args.wiki_root).expanduser()
     if not wiki_root.is_dir():

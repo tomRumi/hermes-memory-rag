@@ -104,10 +104,72 @@ All optional; the defaults are the ones above.
 | `HERMES_RAG_SKIP_JSON_DIRS` | empty | comma-separated directories whose generated JSON should never be indexed |
 | `HERMES_RAG_PROJECTS_FILE` | `~/.hermes/projects.yaml` | which project a directory belongs to |
 | `HERMES_RAG_EDITOR_MODEL` | `granite4:3b` | the model that merges notes into the wiki |
+| `HERMES_RAG_TOKENS_FILE` | `~/.config/memory-rag/tokens.json` | bearer tokens accepted over HTTP (see below) |
+| `MEMORY_RAG_LOCAL_NAMESPACE` | `legacy` | namespace of the local caller (stdio, in-process scripts) |
 
 If your project keeps generated JSON indexes or caches in a directory of their own, add it to
 `HERMES_RAG_SKIP_JSON_DIRS`. They are worthless for searching and, because JSON is dense, a
 4500-character piece of it can exceed the embedding model's limit.
+
+## Who may call it (HTTP)
+
+Over stdio the caller is the local user and nothing is checked: it may write and ingest,
+in the namespace `MEMORY_RAG_LOCAL_NAMESPACE` names (default `legacy`; an invalid value is
+refused, not replaced). Served over HTTP
+(`HERMES_RAG_TRANSPORT=streamable-http`) every request needs
+`Authorization: Bearer <token>`, and the server will not start without a tokens file.
+The file holds the sha256 of each token, never the token. It must be a regular file
+(not a symlink) owned by the server user with mode 0600, in a directory of mode 0700;
+otherwise every token is refused:
+
+```json
+{"<sha256 hex>": {"namespace": "acme", "ingest": false, "write": true}}
+```
+
+A token belongs to one namespace and everything it reads or writes lives inside it:
+collections become `rag_<namespace>.<project>__<layer>`, and the usage ledger is
+scoped the same way. The reserved namespace `legacy` is unprefixed, i.e. the store as
+it was before namespaces. `ingest` (default false) allows `ingest_code` / `ingest_wiki`,
+which read the server's disk and rebuild whole layers. `write` (default true, so older
+entries keep working) set to `false` makes a read-only token: it may call `recall` and
+`stats`, and every tool that changes the store (`learn`, `retire`, `ingest_code`,
+`ingest_wiki`) refuses it with "this token is read-only" before touching anything.
+`"ingest": true` with `"write": false` contradicts itself: that entry is refused and
+logged, the rest of the file stays valid. A `write` that is not a JSON boolean (e.g.
+`"false"`) is malformed and, like any malformed entry, invalidates the whole file. The
+file is re-read when it changes and consulted on every call, so tokens can be added,
+revoked or have their `ingest` / `write` rights changed without a restart, even inside
+an open session. Generate one with
+`python3 -c "import secrets;print(secrets.token_urlsafe(32))"` and store
+`printf %s "$TOKEN" | sha256sum`.
+
+To ingest a wiki into a namespace locally, e.g. `vps-host`:
+
+```bash
+HERMES_RAG_STORE=/home/ubuntu/memory-store .venv/bin/python scripts/reindex_wiki.py \
+    --wiki-root ~/.hermes/wikis --project my-project --namespace vps-host
+```
+
+### Moving a namespace
+
+`scripts/migrate_namespace.py` copies every collection of one namespace to another in
+the same store (ids, documents, metadatas and embeddings exactly, no re-embedding, index
+settings kept), copies the usage-ledger rows with their scope rewritten, rewrites a
+`namespace` metadata field where one names the source, and verifies counts, id sets and
+a sample of embeddings. It never deletes the source, refuses an existing target unless
+`--force`, and refuses a store another process holds open unless `--i-stopped-the-service`.
+Stop the service and back up first:
+
+```bash
+systemctl --user stop memory-rag
+.venv/bin/python scripts/backup.py --store /home/ubuntu/memory-store
+cp -a /home/ubuntu/memory-store /home/ubuntu/memory-store.pre-vps-host  # raw copy: fastest rollback
+.venv/bin/python scripts/migrate_namespace.py --store /home/ubuntu/memory-store \
+    --from legacy --to vps-host --dry-run          # names and counts only
+.venv/bin/python scripts/migrate_namespace.py --store /home/ubuntu/memory-store \
+    --from legacy --to vps-host --i-stopped-the-service
+systemctl --user start memory-rag
+```
 
 ## Which project am I in?
 

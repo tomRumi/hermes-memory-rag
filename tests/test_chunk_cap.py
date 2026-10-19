@@ -67,6 +67,9 @@ class TestIngestEndToEndWithCap:
         (repo / "db" / "cache.json").write_text('{"a": "' + "x" * 400000 + '"}')
 
         monkeypatch.setattr(server, "_client", lambda: _fresh_client(tmp_path))
+        # The usage ledger lives in STORE_DIR: keep it in the temp dir too, never
+        # in whatever real store the environment points at.
+        monkeypatch.setattr(server, "STORE_DIR", tmp_path)
         # fake the embedder to avoid Ollama in tests, but make it REJECT
         # inputs over the real limit so the cap is actually exercised
         monkeypatch.setattr(server, "_embed_model", _StrictFakeEmbed)

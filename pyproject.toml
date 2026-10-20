@@ -1,6 +1,6 @@
 [project]
 name = "hermes-memory-rag"
-version = "0.1.0"
+version = "0.2.0"
 description = "Project memory that outlives the context window: a Chroma store with wiki, code and learning layers, served to Hermes as an MCP server"
 requires-python = ">=3.11"
 license = { text = "MIT" }

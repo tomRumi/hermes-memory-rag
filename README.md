@@ -173,7 +173,7 @@ an open session. Generate one with
 To ingest a wiki into a namespace locally, e.g. `vps-host`:
 
 ```bash
-HERMES_RAG_STORE=/home/ubuntu/memory-store .venv/bin/python scripts/reindex_wiki.py \
+HERMES_RAG_STORE=<store> .venv/bin/python scripts/reindex_wiki.py \
     --wiki-root ~/.hermes/wikis --project my-project --namespace vps-host
 ```
 
@@ -331,12 +331,12 @@ Stop the service and back up first:
 
 ```bash
 systemctl --user stop memory-rag
-.venv/bin/python scripts/backup.py --store /home/ubuntu/memory-store
-cp -a /home/ubuntu/memory-store /home/ubuntu/memory-store.pre-vps-host  # raw copy: fastest rollback
-.venv/bin/python scripts/migrate_namespace.py --store /home/ubuntu/memory-store \
-    --from legacy --to vps-host --dry-run          # names and counts only
-.venv/bin/python scripts/migrate_namespace.py --store /home/ubuntu/memory-store \
-    --from legacy --to vps-host --i-stopped-the-service
+.venv/bin/python scripts/backup.py --store <store>
+cp -a <store> <store>.pre-migration  # raw copy: fastest rollback
+.venv/bin/python scripts/migrate_namespace.py --store <store> \
+    --from <from> --to <to> --dry-run          # names and counts only
+.venv/bin/python scripts/migrate_namespace.py --store <store> \
+    --from <from> --to <to> --i-stopped-the-service
 systemctl --user start memory-rag
 ```
 
@@ -514,6 +514,8 @@ the learnings you deposit, your wiki pages, and **excerpts of your project's sou
 it out of any repository.
 
 ## Status
+
+**Version 0.2.0** adds the token directory (`tokens.d`), per-namespace allowed folders, unverified notes, `reindex_wiki`, and `recall` across projects (`project="*"`).
 
 Built and testable: the installer, the server (recall, learn, retire, stats, ingest), the status
 model that makes replacement and withdrawal reversible, the cross-project layer, project attribution

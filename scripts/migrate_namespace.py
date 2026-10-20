@@ -30,13 +30,13 @@ What it does, and does not do:
 Operator procedure (live store):
 
     systemctl --user stop memory-rag
-    <venv>/bin/python scripts/backup.py --store /home/ubuntu/memory-store
-    cp -a /home/ubuntu/memory-store /home/ubuntu/memory-store.pre-vps-host  # raw rollback copy
-    <venv>/bin/python scripts/migrate_namespace.py --store /home/ubuntu/memory-store \\
-        --from legacy --to vps-host --dry-run
-    <venv>/bin/python scripts/migrate_namespace.py --store /home/ubuntu/memory-store \\
-        --from legacy --to vps-host --i-stopped-the-service
-    # add a vps-host entry to tokens.json, repoint clients, then
+    <venv>/bin/python scripts/backup.py --store <store>
+    cp -a <store> <store>.pre-migration  # raw rollback copy
+    <venv>/bin/python scripts/migrate_namespace.py --store <store> \\
+        --from <from> --to <to> --dry-run
+    <venv>/bin/python scripts/migrate_namespace.py --store <store> \\
+        --from <from> --to <to> --i-stopped-the-service
+    # add an entry for the target namespace to tokens.json, repoint clients, then
     systemctl --user start memory-rag
 
 Exit status: 0 done (or dry run), 1 refused or verification failed, 2 bad usage.
